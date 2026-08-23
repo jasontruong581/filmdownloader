@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import time
+from collections import OrderedDict
+import re
+from pathlib import Path
+from urllib.parse import unquote, urljoin, urldefrag, urlparse
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from .capture import _build_driver, _try_play_in_current_context
+from .models import CaptureResult, StreamCandidate
+
+
+def is_quatvn_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "quatvn.my" or host.endswith(".quatvn.my")
+
+
+def is_quatvn_stream_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    return host == "quatvn2.net" and path.startswith("/stream/") and path.endswith(".webp")
+
+
+def collection_slug_token(page_url: str) -> str:
+    path = (urlparse(page_url).path or "").strip("/")
+    slug = path.split("/")[-1] if path else ""
+    slug = re.sub(r"-collection$", "", slug, flags=re.IGNORECASE)
+    slug = slug.replace("-", " ").replace("_", " ").strip().lower()
+    return slug
+
+
+def _quatvn_stream_parts(url: str) -> tuple[str, int | None]:
+    path = urlparse(url).path or ""
+    name = unquote(path.rsplit("/", 1)[-1])
+    match = re.search(r"^(?P<prefix>.+?)\s*\((?P<num>\d+)\)\.webp$", name, re.IGNORECASE)
+    if match:
+        prefix = match.group("prefix").strip().lower()
+        return prefix, int(match.group("num"))
+    return Path(name).stem.strip().lower(), None
+
+
+def _quatvn_stream_sort_key(url: str) -> tuple[str, int, str]:
+    prefix, number = _quatvn_stream_parts(url)
+    path = urlparse(url).path or ""
+    decoded = unquote(path.rsplit("/", 1)[-1]).lower()
+    return prefix, number or 0, decoded
+
+
+def _stream_matches_collection(url: str, page_url: str) -> bool:
+    prefix, number = _quatvn_stream_parts(url)
+    if number is None:
+        return False
+    token = collection_slug_token(page_url)
+    if not token:
+        return True
+    token_parts = [part for part in token.split() if part]
+    prefix_parts = [part for part in prefix.split() if part]
+    return bool(token_parts) and token_parts == prefix_parts
+
+
+def _is_generic_quatvn_path(path: str) -> bool:
+    slug = (path or "").strip("/").lower()
+    if not slug:
+        return True
+    if "/" in slug:
+        return False
+
+    generic_slugs = {
+        "cn",
+        "hot",
+        "jp",
+        "kr",
+        "my",
+        "th",
+        "top-10",
+        "trending",
+        "us",
+        "phim-sex-vn",
+    }
+    if slug in generic_slugs:
+        return True
+    if re.fullmatch(r"[a-z]{2}", slug):
+        return True
+    return False
+
+
+def _score_quatvn_target_href(href: str, page_url: str, scope_text: str, media_src: str) -> int:
+    parsed = urlparse(href)
+    page_host = (urlparse(page_url).hostname or "").lower()
+    host = (parsed.hostname or "").lower()
+    if host != page_host:
+        return -999
+
+    path = (parsed.path or "").strip("/")
+    if not path or href == page_url:
+        return -999
+    if _is_generic_quatvn_path(path):
+        return -999
+    if path.endswith("-collection"):
+        return -999
+
+    token = collection_slug_token(page_url)
+    href_slug = path.split("/")[-1].replace("-", " ").replace("_", " ").lower()
+    media_prefix, media_number = _quatvn_stream_parts(media_src)
+    text = (scope_text or "").lower()
+
+    score = 0
+    if token and token in href_slug:
+        score += 100
+    if token and token in text:
+        score += 40
+    if media_prefix and media_prefix in href_slug:
+        score += 90
+    if media_prefix and media_prefix in text:
+        score += 30
+    if media_number is not None and str(media_number) in href_slug:
+        score += 25
+    if re.search(r"\d{4,}", href_slug):
+        score += 10
+    if path.count("/") <= 1:
+        score += 5
+
+    return score
+
+
+def extract_quatvn_stream_candidates(capture: CaptureResult, page_url: str | None = None) -> list[StreamCandidate]:
+    dedup: OrderedDict[str, StreamCandidate] = OrderedDict()
+
+    for req in capture.requests:
+        if not is_quatvn_stream_url(req.url):
+            continue
+        if page_url and not _stream_matches_collection(req.url, page_url):
+            continue
+        dedup[req.url] = StreamCandidate(
+            url=req.url,
+            kind="quatvn_webp",
+            score=80,
+            source="quatvn_stream",
+            status_code=req.status,
+            content_type=req.response_headers.get("content-type") or req.response_headers.get("Content-Type"),
+        )
+
+    return sorted(dedup.values(), key=lambda item: _quatvn_stream_sort_key(item.url))
+
+
+def _normalize_http_url(raw_url: str, base_url: str) -> str | None:
+    if not raw_url:
+        return None
+    resolved = urljoin(base_url, raw_url.strip())
+    cleaned, _ = urldefrag(resolved)
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    return parsed.geturl()
+
+
+def _extract_media_like_urls(driver, base_url: str) -> list[str]:
+    raw_urls = driver.execute_script(
+        """
+        const selectors = ['iframe', 'video', 'source', 'embed'];
+        const attrs = ['src', 'data-src', 'data-lazy-src', 'data-url', 'data-iframe'];
+        const found = [];
+
+        for (const selector of selectors) {
+          for (const node of document.querySelectorAll(selector)) {
+            for (const attr of attrs) {
+              const value = node.getAttribute(attr);
+              if (value) found.push(value);
+            }
+          }
+        }
+
+        for (const node of document.querySelectorAll('[data-settings], [data-player], [data-config], script')) {
+          const text = node.getAttribute('data-settings')
+            || node.getAttribute('data-player')
+            || node.getAttribute('data-config')
+            || node.textContent
+            || '';
+          const matches = text.match(/https?:\/\/[^"'\\s<>()]+/g) || [];
+          for (const item of matches) found.push(item);
+        }
+
+        return found;
+        """
+    )
+
+    normalized: OrderedDict[str, None] = OrderedDict()
+    for item in raw_urls or []:
+        normalized_url = _normalize_http_url(str(item), base_url)
+        if not normalized_url:
+            continue
+        normalized[normalized_url] = None
+    return list(normalized.keys())
+
+
+def _filter_candidate_target(url: str, page_url: str) -> bool:
+    lowered = url.lower()
+    page_host = (urlparse(page_url).hostname or "").lower()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    if url == page_url:
+        return False
+    if any(token in lowered for token in (".css", ".js", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp")):
+        return False
+    if any(token in lowered for token in ("google-analytics", "doubleclick", "googletagmanager", "facebook.com")):
+        return False
+
+    if any(token in lowered for token in ("/embed/", "/player/", "jwplayer", "stream", ".m3u8", ".mpd", ".mp4")):
+        return True
+
+    if host and host != page_host and any(token in lowered for token in ("video", "embed", "play", "player")):
+        return True
+
+    return False
+
+
+def _collect_tab_elements(driver):
+    selectors = ",".join(
+        [
+            '[role="tab"]',
+            '[data-bs-toggle="tab"]',
+            '[data-toggle="tab"]',
+            '[aria-controls]',
+            '.nav-tabs a',
+            '.nav-tabs button',
+            '.tabs a',
+            '.tabs button',
+            '.tab a',
+            '.tab button',
+            '.elementor-tab-title',
+        ]
+    )
+    elements = driver.find_elements(By.CSS_SELECTOR, selectors)
+    unique = []
+    seen: set[str] = set()
+
+    for element in elements:
+        try:
+            href = (element.get_attribute("href") or "").strip()
+            text = (element.text or "").strip()
+            role = (element.get_attribute("role") or "").strip().lower()
+            aria_controls = (element.get_attribute("aria-controls") or "").strip()
+            data_toggle = (element.get_attribute("data-toggle") or element.get_attribute("data-bs-toggle") or "").strip()
+        except Exception:
+            continue
+
+        if href and not href.startswith("#") and role != "tab" and not data_toggle and not aria_controls:
+            continue
+
+        key = "|".join([href, text, role, aria_controls, data_toggle])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(element)
+
+    return unique
+
+
+def discover_quatvn_targets(
+    page_url: str,
+    wait_seconds: int = 12,
+    headless: bool = True,
+    tab_pause_seconds: float = 1.0,
+) -> list[str]:
+    driver = _build_driver(headless=headless)
+    discovered: OrderedDict[str, None] = OrderedDict()
+    token = collection_slug_token(page_url)
+
+    try:
+        driver.get(page_url)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        _try_play_in_current_context(driver)
+
+        linked_targets = driver.execute_script(
+            """
+            const out = [];
+            const srcAttrs = ['src', 'data-src', 'data-lazy-src', 'data-url'];
+            const nodes = Array.from(document.querySelectorAll('img, source, video'));
+            const containerSelectors = [
+              '.snax-figure',
+              '.snax-item',
+              '.snax-item-card',
+              '.g1-collection-item',
+              '.g1-collection',
+              'article',
+              'figure',
+              'li',
+              '.swiper-slide',
+              '.flickity-slider > *'
+            ];
+
+            for (const node of nodes) {
+              let mediaSrc = '';
+              for (const attr of srcAttrs) {
+                const value = node.getAttribute(attr);
+                if (value) { mediaSrc = value; break; }
+              }
+              if (!mediaSrc && node.currentSrc) mediaSrc = node.currentSrc;
+              if (!mediaSrc) continue;
+
+              let container = node;
+              for (let i = 0; i < 8 && container; i += 1) {
+                const matches = container.matches && containerSelectors.some((selector) => container.matches(selector));
+                if (matches) break;
+                container = container.parentElement;
+              }
+
+              const hrefs = [];
+              const scope = container || node.parentElement || document;
+              const anchors = Array.from(scope.querySelectorAll ? scope.querySelectorAll('a[href]') : []);
+              for (const anchor of anchors) {
+                const href = anchor.href || anchor.getAttribute('href') || '';
+                if (href) hrefs.push(href);
+              }
+
+              if (!hrefs.length) {
+                let parent = node;
+                for (let i = 0; i < 8 && parent; i += 1) {
+                  if (parent.tagName && parent.tagName.toLowerCase() === 'a') {
+                    const href = parent.href || parent.getAttribute('href') || '';
+                    if (href) hrefs.push(href);
+                    break;
+                  }
+                  parent = parent.parentElement;
+                }
+              }
+
+              out.push({
+                mediaSrc,
+                hrefs,
+                text: (scope && scope.textContent ? scope.textContent : '').slice(0, 300),
+              });
+            }
+            return out;
+            """
+        )
+
+        linked_urls: OrderedDict[str, None] = OrderedDict()
+        matched_media_count = 0
+        for item in linked_targets or []:
+            media_src = _normalize_http_url(str(item.get("mediaSrc") or ""), driver.current_url)
+            hrefs = item.get("hrefs") or []
+            scope_text = str(item.get("text") or "")
+            if not media_src:
+                continue
+            if not is_quatvn_stream_url(media_src):
+                continue
+            if not _stream_matches_collection(media_src, page_url):
+                continue
+            matched_media_count += 1
+            best_href = None
+            best_score = -999
+            for raw_href in hrefs:
+                href = _normalize_http_url(str(raw_href or ""), driver.current_url)
+                if not href:
+                    continue
+                score = _score_quatvn_target_href(href, page_url, scope_text, media_src)
+                if score > best_score:
+                    best_score = score
+                    best_href = href
+            if best_href and best_score >= 60:
+                linked_urls[best_href] = None
+
+        if linked_urls and (matched_media_count == 0 or len(linked_urls) >= max(3, int(matched_media_count * 0.7))):
+            return list(linked_urls.keys())
+
+        for url in _extract_media_like_urls(driver, driver.current_url):
+            if _filter_candidate_target(url, driver.current_url) and (not is_quatvn_stream_url(url) or _stream_matches_collection(url, page_url)):
+                discovered[url] = None
+
+        tab_elements = _collect_tab_elements(driver)
+        for element in tab_elements[:40]:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                driver.execute_script("arguments[0].click();", element)
+                time.sleep(tab_pause_seconds)
+                _try_play_in_current_context(driver)
+            except Exception:
+                continue
+
+            for url in _extract_media_like_urls(driver, driver.current_url):
+                if _filter_candidate_target(url, driver.current_url) and (not is_quatvn_stream_url(url) or _stream_matches_collection(url, page_url)):
+                    discovered[url] = None
+
+        if not discovered:
+            time.sleep(max(wait_seconds, 1))
+            _try_play_in_current_context(driver)
+            for url in _extract_media_like_urls(driver, driver.current_url):
+                if _filter_candidate_target(url, driver.current_url) and (not is_quatvn_stream_url(url) or _stream_matches_collection(url, page_url)):
+                    discovered[url] = None
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    return list(discovered.keys())

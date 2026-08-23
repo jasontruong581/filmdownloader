@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Local Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime captures may contain session cookies or site-specific diagnostics.
+output/
+output_meta_test/
+logs/
+
+# Large local experiments and raw media; keep source code only in Git.
+research_sim/
+research_sim.7z
+docs/project-plan-video-downloader.docx
+*.mp4
+*.ts
+*.m3u8
+*.webp
+*.crdownload
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
