@@ -23,6 +23,7 @@ docs/project-plan-video-downloader.docx
 *.m3u8
 *.webp
 *.crdownload
+*.egg-info/
 
 # Local configuration and editor files
 .env

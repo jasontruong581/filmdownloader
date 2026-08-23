@@ -168,10 +168,10 @@ def _write_description_file(out_file: Path, metadata: PageMetadata) -> None:
     sidecar.write_text(content, encoding="utf-8")
 
 
-def _headers_block(capture: CaptureResult) -> str:
+def _headers_block(capture: CaptureResult, referer: str | None = None) -> str:
     parts: list[str] = []
-    if capture.final_url:
-        parts.append(f"Referer: {capture.final_url}")
+    if referer or capture.final_url:
+        parts.append(f"Referer: {referer or capture.final_url}")
     if capture.cookies:
         cookie_value = "; ".join(f"{k}={v}" for k, v in capture.cookies.items())
         parts.append(f"Cookie: {cookie_value}")
@@ -194,7 +194,7 @@ def build_ffmpeg_command(
     if capture.user_agent:
         cmd.extend(["-user_agent", capture.user_agent])
 
-    headers = _headers_block(capture)
+    headers = _headers_block(capture, candidate.referer)
     if headers:
         cmd.extend(["-headers", headers])
 
@@ -341,9 +341,11 @@ def download_with_ffmpeg(
     candidate: StreamCandidate,
     output_dir: Path,
     metadata_capture: CaptureResult | None = None,
+    output_file: Path | None = None,
+    write_metadata: bool = True,
 ) -> Path:
     metadata_source = metadata_capture or capture
-    metadata = fetch_page_metadata(metadata_source)
+    metadata = fetch_page_metadata(metadata_source) if write_metadata else PageMetadata()
     page_id = _extract_page_id(metadata_source.final_url or metadata_source.page_url)
     preferred_base = metadata.video_code or None
     if page_id and metadata.video_code:
@@ -351,10 +353,12 @@ def download_with_ffmpeg(
     if candidate.kind == "quatvn_webp":
         base_root = preferred_base or _safe_name(metadata_source.title or "quatvn")
         preferred_base = f"{base_root}-{_quatvn_asset_suffix(candidate.url)}"
-    out_file = output_path_for(capture, output_dir, preferred_base=preferred_base)
+    out_file = output_file or output_path_for(capture, output_dir, preferred_base=preferred_base)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     if candidate.kind == "quatvn_webp":
         out_file = _download_quatvn_stream_asset(capture, candidate, out_file)
-        _write_description_file(out_file, metadata)
+        if write_metadata:
+            _write_description_file(out_file, metadata)
         return out_file
 
     cmd = build_ffmpeg_command(capture, candidate, out_file)
@@ -362,11 +366,13 @@ def download_with_ffmpeg(
     if _run_ffmpeg(cmd) != 0:
         if candidate.kind in {"hls", "playlist"} or ".m3u8" in candidate.url.lower() or "manifest" in candidate.url.lower():
             out = download_obfuscated_hls(capture, candidate, out_file)
-            _write_description_file(out, metadata)
+            if write_metadata:
+                _write_description_file(out, metadata)
             return out
         raise RuntimeError("ffmpeg failed")
 
-    _write_description_file(out_file, metadata)
+    if write_metadata:
+        _write_description_file(out_file, metadata)
     return out_file
 
 
@@ -400,7 +406,7 @@ def _is_mpeg_ts(data: bytes) -> bool:
 
 
 def download_obfuscated_hls(capture: CaptureResult, candidate: StreamCandidate, out_file: Path) -> Path:
-    manifest_headers = _request_headers(capture, capture.final_url)
+    manifest_headers = _request_headers(capture, candidate.referer or capture.final_url)
     response = requests.get(candidate.url, headers=manifest_headers, timeout=30)
     if not response.ok:
         raise RuntimeError(f"manifest request failed: HTTP {response.status_code}")
@@ -412,7 +418,7 @@ def download_obfuscated_hls(capture: CaptureResult, candidate: StreamCandidate, 
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     ts_path = out_file.with_suffix(".ts")
-    headers = _request_headers(capture, candidate.url)
+    headers = _request_headers(capture, candidate.referer or candidate.url)
 
     with ts_path.open("wb") as ts:
         for idx, seg_url in enumerate(segment_urls, start=1):

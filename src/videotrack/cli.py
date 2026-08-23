@@ -8,6 +8,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from .capture import capture_page
+from .collection import download_collection, fetch_collection, parse_flowplayer_collection
 from .crawl import crawl_site_links, resolve_crawl_preset, save_urls_to_csv
 from .detect import (
     build_request_headers,
@@ -19,6 +20,8 @@ from .detect import (
 from .download import download_with_ffmpeg
 from .io import load_capture, save_candidates, save_capture, save_json
 from .models import CaptureResult, StreamCandidate
+from .resolvers import capture_from_resolution
+from .static_player import StaticPlayerResolver
 
 
 def _add_shared_capture_args(parser: argparse.ArgumentParser) -> None:
@@ -56,6 +59,7 @@ def _clone_candidate(candidate: StreamCandidate, source: str) -> StreamCandidate
         probe_duration=candidate.probe_duration,
         probe_bitrate=candidate.probe_bitrate,
         validation_note=candidate.validation_note,
+        referer=candidate.referer,
     )
 
 
@@ -77,6 +81,7 @@ def _merge_candidates(
         if new_item.score > existing.score:
             existing.score = new_item.score
             existing.kind = new_item.kind
+            existing.referer = new_item.referer
 
         if new_item.status_code is not None:
             existing.status_code = new_item.status_code
@@ -153,8 +158,8 @@ def _probe_duration_seconds(path: Path) -> float | None:
         return None
 
 
-def _headers_block_for_ffprobe(capture: CaptureResult) -> str:
-    headers = build_request_headers(capture)
+def _headers_block_for_ffprobe(capture: CaptureResult, candidate: StreamCandidate) -> str:
+    headers = build_request_headers(capture, candidate.referer)
     headers.pop("User-Agent", None)
     if not headers:
         return ""
@@ -167,7 +172,7 @@ def _probe_candidate_media(capture: CaptureResult, candidate: StreamCandidate) -
     if capture.user_agent:
         cmd.extend(["-user_agent", capture.user_agent])
 
-    header_block = _headers_block_for_ffprobe(capture)
+    header_block = _headers_block_for_ffprobe(capture, candidate)
     if header_block:
         cmd.extend(["-headers", header_block])
 
@@ -488,15 +493,8 @@ def cmd_download(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    _apply_autonomous_overrides(args)
-    capture = capture_page(
-        url=args.url,
-        wait_seconds=args.wait,
-        headless=not args.headed,
-    )
+def _run_capture_pipeline(args: argparse.Namespace, capture: CaptureResult) -> int:
     save_capture(capture, Path(args.capture_out))
-
     candidates, stage_counts, all_candidates = _prepare_candidates(
         capture=capture,
         probe=not args.no_probe,
@@ -545,6 +543,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    _apply_autonomous_overrides(args)
+    if args.resolver in {"auto", "static"}:
+        resolution = StaticPlayerResolver().resolve(args.url)
+        if resolution:
+            capture = capture_from_resolution(resolution)
+            print(f"[+] Static resolver matched: {resolution.resolver} ({len(resolution.media)} candidate(s))")
+            result = _run_capture_pipeline(args, capture)
+            if result == 0 or args.resolver == "static":
+                return result
+            print("[i] Static download path failed; retrying with browser network capture.")
+        elif args.resolver == "static":
+            print("[!] Static resolver found no supported media on this page.")
+            return 2
+
+    capture = capture_page(
+        url=args.url,
+        wait_seconds=args.wait,
+        headless=not args.headed,
+    )
+    return _run_capture_pipeline(args, capture)
+
+
 def cmd_crawl_links(args: argparse.Namespace) -> int:
     preset = resolve_crawl_preset(args.url, args.site_preset)
     include_substring = preset.include_substring if args.include_substring is None else args.include_substring
@@ -569,6 +590,27 @@ def cmd_crawl_links(args: argparse.Namespace) -> int:
     if len(result.matched_urls) > 20:
         print(f"... ({len(result.matched_urls) - 20} more)")
     return 0
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    if args.html_file:
+        html_text = Path(args.html_file).read_text(encoding="utf-8")
+        collection = parse_flowplayer_collection(html_text, args.source_url or "https://example.invalid/collection")
+    else:
+        collection = fetch_collection(args.url)
+    if not collection.videos:
+        print("[!] No Flowplayer collection entries found.")
+        return 2
+    manifest = download_collection(
+        collection,
+        output_dir=Path(args.output_dir),
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+    completed = sum(item["status"] in {"downloaded", "skipped_existing", "dry_run"} for item in manifest["videos"])
+    print(f"[+] Collection: {collection.title}")
+    print(f"[+] Items: {completed}/{manifest['expected_count']}")
+    return 0 if completed == manifest["expected_count"] else 3
 
 
 def _add_selection_flags(parser: argparse.ArgumentParser) -> None:
@@ -635,6 +677,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--output-dir", default="output")
     p_run.add_argument("--extra-wait", type=int, default=45, help="Extra seconds for second deep-scan pass")
     p_run.add_argument("--no-probe", action="store_true")
+    p_run.add_argument(
+        "--resolver",
+        choices=["auto", "static", "browser"],
+        default="auto",
+        help="Resolution strategy: static first, static only, or browser only",
+    )
     _add_autonomous_flag(p_run)
     _add_selection_flags(p_run)
     p_run.set_defaults(func=cmd_run)
@@ -667,6 +715,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Custom User-Agent for crawl requests",
     )
     p_crawl.set_defaults(func=cmd_crawl_links)
+
+    p_collect = sub.add_parser("collect", help="Download direct media listed in a static Flowplayer collection")
+    source_group = p_collect.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--url", help="Authorized collection page URL")
+    source_group.add_argument("--html-file", help="Saved collection HTML for offline parsing")
+    p_collect.add_argument("--source-url", default="", help="Source URL when parsing a saved HTML file")
+    p_collect.add_argument("--output-dir", default="output/collections")
+    p_collect.add_argument("--dry-run", action="store_true")
+    p_collect.add_argument("--overwrite", action="store_true")
+    p_collect.set_defaults(func=cmd_collect)
 
     return parser
 
