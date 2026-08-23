@@ -22,6 +22,7 @@ Use only with content you own or are authorized to access and download. This pro
 python -m venv .venv
 .venv\\Scripts\\activate
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Quick start
@@ -75,13 +76,32 @@ The batch runner maintains `order`, `id`, `proceed_status`, and error fields in 
 - `--rank-top-n 10` changes how many candidates receive ffprobe ranking.
 - `--min-duration 120` rejects outputs shorter than the given duration in seconds.
 
+## Resolver order
+
+`run` uses `--resolver auto` by default. It first tries the lightweight static-player resolver for pages that expose supported player metadata and a compatible player endpoint. If that resolver is unsupported, finds no media, or its download path fails, the CLI falls back to Chrome network capture. Use `--resolver browser` to force browser capture or `--resolver static` to diagnose only the static path.
+
+For an authorized Flowplayer collection with media entries embedded in `data-item` attributes, use:
+
+```bash
+python main.py collect --url "https://example.org/collection/" --output-dir output/collections
+```
+
+`collect` writes `output/collections/<collection-slug>/manifest.json` (or the equivalent beneath `--output-dir`). By default it skips an existing direct-media file only when its size matches the source `Content-Length`; use `--overwrite` to download again. It also supports `--dry-run` for parsing and writing a manifest without downloading.
+
 ## Repository layout
 
 ```text
-src/videotrack/       Core capture, detection, crawl, and download modules
+src/videotrack/       Core resolution, capture, detection, crawl, and download modules
 main.py               CLI entry point
 batch_run_csv.py      Resumable sequential CSV runner
 docs/                 Project planning material
 output/               Local media and batch state (ignored)
 logs/                 Local captures and diagnostics (ignored)
+tests/                Offline unit tests
+```
+
+Run the offline test suite after installing the project:
+
+```bash
+python -m unittest discover -s tests -v
 ```
