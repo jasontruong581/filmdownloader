@@ -79,6 +79,7 @@ class StreamCandidate:
     probe_duration: float | None = None
     probe_bitrate: int | None = None
     validation_note: str | None = None
+    referer: str | None = None
 
     def __post_init__(self) -> None:
         if self.host is None:
@@ -96,4 +97,5 @@ class StreamCandidate:
             "probe_duration": self.probe_duration,
             "probe_bitrate": self.probe_bitrate,
             "validation_note": self.validation_note,
+            "referer": self.referer,
         }

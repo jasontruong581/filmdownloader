@@ -112,10 +112,10 @@ def _media_fallback_kind(content_type: str | None) -> tuple[str, int] | None:
     return ("media", 50)
 
 
-def build_request_headers(capture: CaptureResult) -> dict[str, str]:
+def build_request_headers(capture: CaptureResult, referer: str | None = None) -> dict[str, str]:
     headers: dict[str, str] = {
         "User-Agent": capture.user_agent,
-        "Referer": capture.final_url,
+        "Referer": referer or capture.final_url,
     }
     if capture.cookies:
         headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in capture.cookies.items())
@@ -198,6 +198,7 @@ def precheck_hls_candidates(
             if not _looks_like_hls(candidate):
                 continue
             checked += 1
+            session.headers["Referer"] = candidate.referer or capture.final_url
 
             try:
                 playlist = session.get(candidate.url, timeout=12)
@@ -287,6 +288,7 @@ def detect_candidates(capture: CaptureResult, probe: bool = True) -> list[Stream
             source="network_log",
             status_code=req.status,
             content_type=content_type,
+            referer=req.headers.get("Referer") or req.headers.get("referer") or capture.final_url,
         )
 
     candidates = sorted(dedup.values(), key=lambda x: x.score, reverse=True)
@@ -297,6 +299,7 @@ def detect_candidates(capture: CaptureResult, probe: bool = True) -> list[Stream
             session.headers.update(headers)
             for candidate in candidates[:12]:
                 try:
+                    session.headers["Referer"] = candidate.referer or capture.final_url
                     response = session.get(candidate.url, timeout=12, stream=True)
                     candidate.status_code = response.status_code
                     candidate.content_type = response.headers.get("content-type", candidate.content_type)
