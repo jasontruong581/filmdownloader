@@ -22,10 +22,20 @@ from .core.io import load_capture, save_candidates, save_capture, save_json
 from .core.models import CaptureResult, StreamCandidate
 from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
 from .engines import ytdlp_version
+from .engines.batch import probe as batch_probe, sample_verify
+from .engines.browser_resolver import BrowserOptions
+from .engines.chain import (
+    DEFAULT_ENGINE_ORDER,
+    RESOLVER_ALIASES,
+    ChainOptions,
+    engine_choices,
+)
+from .engines.chain import resolve as chain_resolve
+from .engines.chain import resolve_by_engine
+from .engines.ytdlp_resolver import YtDlpOptions
 from .core.resolvers import capture_from_resolution
 from .hosts import DEFAULT_HOST_BONUSES
 from .sites import plugin_names
-from .sites.vlxx import StaticPlayerResolver
 
 
 def _add_shared_capture_args(parser: argparse.ArgumentParser) -> None:
@@ -553,25 +563,33 @@ def _run_capture_pipeline(args: argparse.Namespace, capture: CaptureResult) -> i
 
 def cmd_run(args: argparse.Namespace) -> int:
     _apply_autonomous_overrides(args)
-    if args.resolver in {"auto", "static"}:
-        resolution = StaticPlayerResolver().resolve(args.url)
-        if resolution:
-            capture = capture_from_resolution(resolution)
-            print(f"[+] Static resolver matched: {resolution.resolver} ({len(resolution.media)} candidate(s))")
-            result = _run_capture_pipeline(args, capture)
-            if result == 0 or args.resolver == "static":
-                return result
-            print("[i] Static download path failed; retrying with browser network capture.")
-        elif args.resolver == "static":
-            print("[!] Static resolver found no supported media on this page.")
-            return 2
+    options = _chain_options(args)
 
-    capture = capture_page(
-        url=args.url,
-        wait_seconds=args.wait,
-        headless=not args.headed,
-    )
-    return _run_capture_pipeline(args, capture)
+    attempted = False
+    last_result = 2
+    for engine_name, resolutions in resolve_by_engine(args.url, options):
+        attempted = True
+        resolution = resolutions[0]
+        if len(resolutions) > 1:
+            print(
+                f"[i] {engine_name} enumerated {len(resolutions)} items; downloading the first. "
+                "Use probe-batch to list them all."
+            )
+        print(f"[+] Engine {engine_name} resolved: {resolution.title or resolution.final_url}")
+        if resolution.formats:
+            print(f"[i] {len(resolution.formats)} selectable format(s); best: {resolution.formats[0].label()}")
+
+        capture = capture_from_resolution(resolution)
+        last_result = _run_capture_pipeline(args, capture)
+        if last_result == 0:
+            return 0
+        print(f"[i] {engine_name} download path failed; trying the next engine.")
+
+    if not attempted:
+        print("[!] No engine resolved media on this page.")
+        return 2
+    print("[!] Every engine that resolved this page failed to download it.")
+    return last_result
 
 
 def cmd_crawl_links(args: argparse.Namespace) -> int:
@@ -653,6 +671,75 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _chain_options(args: argparse.Namespace) -> ChainOptions:
+    """Build chain options from the flags, honoring the retired --resolver alias."""
+    engines = DEFAULT_ENGINE_ORDER
+    selected = getattr(args, "engine", None)
+    if selected:
+        engines = tuple(selected)
+    else:
+        legacy = getattr(args, "resolver", None)
+        if legacy:
+            engines = RESOLVER_ALIASES.get(legacy, DEFAULT_ENGINE_ORDER)
+
+    return ChainOptions(
+        engines=engines,
+        ytdlp=YtDlpOptions(cookies_from_browser=getattr(args, "cookies_from_browser", None) or None),
+        browser=BrowserOptions(
+            wait_seconds=getattr(args, "wait", 15),
+            headless=not getattr(args, "headed", False),
+        ),
+    )
+
+
+def cmd_list_formats(args: argparse.Namespace) -> int:
+    resolutions = chain_resolve(args.url, _chain_options(args))
+    if not resolutions:
+        print("[!] No engine resolved this URL.")
+        return 2
+
+    for index, resolution in enumerate(resolutions, start=1):
+        header = f"{index}. {resolution.title or resolution.final_url}"
+        print(f"\n{header}")
+        print(f"   engine={resolution.engine} duration={resolution.duration or '?'}")
+        if not resolution.formats:
+            print("   (this engine reports no selectable formats; it found direct media only)")
+            for media in resolution.media[:5]:
+                print(f"   - {media.kind:6} {media.url}")
+            continue
+        for fmt in resolution.formats:
+            print(f"   - {fmt.format_id:>8}  {fmt.label()}")
+    return 0
+
+
+def cmd_probe_batch(args: argparse.Namespace) -> int:
+    result = batch_probe(args.url)
+
+    print(f"capability : {result.capability}")
+    print(f"confidence : {result.confidence}")
+    print(f"items      : {len(result.items)}" + (f" of ~{result.total_estimate}" if result.total_estimate else ""))
+    if result.truncated:
+        print("             (list was capped; more items exist)")
+
+    if not result.is_batchable:
+        print(f"batchable  : no")
+        print(f"reason     : {result.reason}")
+        return 2
+
+    print("batchable  : yes")
+    if result.confidence == "possible":
+        print("note       : these are page links, not confirmed media")
+    for index, item in enumerate(result.items[:40], start=1):
+        print(f"  {index:3}. {item.title or item.url}")
+    if len(result.items) > 40:
+        print(f"  ... ({len(result.items) - 40} more)")
+
+    if args.verify:
+        verified, attempted = sample_verify(result.items, args.verify)
+        print(f"verified   : {verified}/{attempted} sampled item(s) resolve")
+    return 0
+
+
 def _add_selection_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-host", action="append", default=[], help="Allow only candidates from this host (repeatable)")
     parser.add_argument("--prefer-host", action="append", default=[], help="Boost candidates from this host (repeatable)")
@@ -718,10 +805,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--extra-wait", type=int, default=45, help="Extra seconds for second deep-scan pass")
     p_run.add_argument("--no-probe", action="store_true")
     p_run.add_argument(
+        "--engine",
+        action="append",
+        choices=list(engine_choices()),
+        help="Engine chain to try, in order (repeatable). Default: yt-dlp, then site plugins, then browser",
+    )
+    p_run.add_argument(
         "--resolver",
-        choices=["auto", "static", "browser"],
+        choices=list(RESOLVER_ALIASES),
         default="auto",
-        help="Resolution strategy: static first, static only, or browser only",
+        help="Deprecated alias for --engine, kept for existing scripts",
+    )
+    p_run.add_argument(
+        "--format",
+        dest="format_id",
+        default="",
+        help="Format id to download, as listed by list-formats",
+    )
+    p_run.add_argument(
+        "--cookies-from-browser",
+        default="",
+        help="Reuse a browser profile's cookies, e.g. chrome (best effort, off by default)",
     )
     _add_autonomous_flag(p_run)
     _add_selection_flags(p_run)
@@ -729,6 +833,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="Report external tool and plugin availability")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_formats = sub.add_parser("list-formats", help="Show the selectable formats an engine reports")
+    p_formats.add_argument("url", help="Page URL you are authorized to analyze")
+    p_formats.add_argument("--engine", action="append", choices=list(engine_choices()), help="Restrict the engine chain (repeatable, in order)")
+    p_formats.add_argument("--wait", type=int, default=15, help="Seconds to wait when the browser engine is used")
+    p_formats.add_argument("--headed", action="store_true", help="Run Chrome with UI when the browser engine is used")
+    p_formats.add_argument("--cookies-from-browser", default="", help="Reuse a browser profile's cookies, e.g. chrome (best effort)")
+    p_formats.set_defaults(func=cmd_list_formats)
+
+    p_probe = sub.add_parser("probe-batch", help="Check whether a URL enumerates multiple downloadable items")
+    p_probe.add_argument("url", help="Page URL you are authorized to analyze")
+    p_probe.add_argument("--verify", type=int, default=0, help="Fully resolve the first N items to raise confidence")
+    p_probe.set_defaults(func=cmd_probe_batch)
 
     p_crawl = sub.add_parser("crawl-links", help="Crawl a website and export discovered child URLs to CSV")
     p_crawl.add_argument("url", help="Start URL to crawl")

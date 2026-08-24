@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import requests
 
 from ..core.download import download_with_ffmpeg
-from ..core.models import CaptureResult, StreamCandidate
+from ..core.models import BatchItem, BatchProbe, CaptureResult, StreamCandidate
 from ..core.resolvers import DEFAULT_USER_AGENT, media_kind
 from . import BaseSitePlugin, register
 
@@ -189,6 +189,27 @@ class FlowplayerPlugin(BaseSitePlugin):
 
     def handles(self, url: str) -> bool:
         return False
+
+    def probe_batch(self, url: str) -> BatchProbe | None:
+        """Count the collection entries this page embeds. One request."""
+        try:
+            collection = fetch_collection(url)
+        except requests.RequestException:
+            return None
+
+        if len(collection.videos) < 2:
+            return None
+
+        return BatchProbe(
+            capability="collection",
+            confidence="proven",
+            items=tuple(
+                BatchItem(url=video.source_url, title=video.title) for video in collection.videos
+            ),
+            total_estimate=len(collection.videos),
+            truncated=False,
+            reason="",
+        )
 
 
 register(FlowplayerPlugin())
