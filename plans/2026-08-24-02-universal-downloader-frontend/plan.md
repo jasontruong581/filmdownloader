@@ -104,8 +104,8 @@ yt-dlp's hooks actually emit.
 
 | Order | Phase | Name | Status | Depends on |
 |-------|-------|------|--------|-----------|
-| 1 | 1a | [Characterization tests, moves, plugin registry](./phase-01a-core-and-site-plugins.md) | Planned | - |
-| 2 | 2 | [yt-dlp engine, executors, batch probe](./phase-02-ytdlp-engine.md) | Planned | 1a |
+| 1 | 1a | [Characterization tests, moves, plugin registry](./phase-01a-core-and-site-plugins.md) | **Done** | - |
+| 2 | 2 | [yt-dlp engine, executors, batch probe](./phase-02-ytdlp-engine.md) | **Done** | 1a |
 | 3 | 1b | [Pipeline extraction and event injection](./phase-01b-pipeline-extraction.md) | Planned | 1a, 2 |
 | 4 | 3 | [Job store and progress events](./phase-03-job-layer.md) | Planned | 1b, 2 |
 | 5 | 4 | [FastAPI backend](./phase-04-api-server.md) | Planned | 3 |
