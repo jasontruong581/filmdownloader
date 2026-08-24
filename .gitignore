@@ -18,10 +18,16 @@ logs/
 research_sim/
 research_sim.7z
 docs/project-plan-video-downloader.docx
-*.mp4
-*.ts
-*.m3u8
-*.webp
+# Media artifacts. Scoped to the download directories: a bare *.ts also
+# ignores TypeScript sources, which silently left the frontend untracked.
+output/**/*.mp4
+output/**/*.ts
+output/**/*.m3u8
+output/**/*.webp
+logs/**/*.mp4
+logs/**/*.ts
+logs/**/*.m3u8
+logs/**/*.webp
 *.crdownload
 *.egg-info/
 
@@ -37,3 +43,4 @@ web/node_modules/
 web/dist/
 web/openapi.json
 src/videotrack/server/static/
+web/tsconfig.tsbuildinfo
