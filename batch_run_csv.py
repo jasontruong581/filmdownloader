@@ -303,7 +303,7 @@ def _process_quatvn_row(
         candidate = next((item for item in quatvn_candidates if item.url == target), None)
         if candidate is None:
             row["last_error"] = f"missing_candidate={target}"
-            print(f"[!] missing candidate for target")
+            print(f"[!] missing candidate for target: {target}")
             continue
 
         if args.dry_run:

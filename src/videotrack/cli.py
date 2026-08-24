@@ -1,25 +1,22 @@
 ﻿from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
-from collections import OrderedDict
 from pathlib import Path
 
+from .console import print_event
 from .core.capture import capture_page
 from .sites.flowplayer import download_collection, fetch_collection, parse_flowplayer_collection
 from .crawl import crawl_preset_choices, crawl_site_links, resolve_crawl_preset, save_urls_to_csv
-from .core.detect import (
-    build_request_headers,
-    detect_candidates,
-    extract_embed_urls,
-    filter_candidates_by_host,
-    precheck_hls_candidates,
-)
-from .core.download import download_with_ffmpeg
 from .core.io import load_capture, save_candidates, save_capture, save_json
 from .core.models import CaptureResult, StreamCandidate
+from .core.options import PipelineOptions
+from .core.pipeline import (
+    download_with_fallback,
+    prepare_candidates,
+    resolve_download_capture,
+)
+from .core.pipeline import run as pipeline_run
 from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
 from .engines import ytdlp_version
 from .engines.batch import probe as batch_probe, sample_verify
@@ -61,201 +58,16 @@ def _apply_autonomous_overrides(args: argparse.Namespace) -> None:
         args.interactive_pick = False
 
 
-def _clone_candidate(candidate: StreamCandidate, source: str) -> StreamCandidate:
-    return StreamCandidate(
-        url=candidate.url,
-        kind=candidate.kind,
-        score=candidate.score,
-        source=source,
-        status_code=candidate.status_code,
-        content_type=candidate.content_type,
-        host=candidate.host,
-        probe_duration=candidate.probe_duration,
-        probe_bitrate=candidate.probe_bitrate,
-        validation_note=candidate.validation_note,
-        referer=candidate.referer,
-    )
-
-
-def _merge_candidates(
-    merged: OrderedDict[str, StreamCandidate],
-    incoming: list[StreamCandidate],
-    source: str,
-) -> None:
-    for candidate in incoming:
-        new_item = _clone_candidate(candidate, source)
-        existing = merged.get(new_item.url)
-        if existing is None:
-            merged[new_item.url] = new_item
-            continue
-
-        if source not in existing.source.split(","):
-            existing.source = f"{existing.source},{source}"
-
-        if new_item.score > existing.score:
-            existing.score = new_item.score
-            existing.kind = new_item.kind
-            existing.referer = new_item.referer
-
-        if new_item.status_code is not None:
-            existing.status_code = new_item.status_code
-        if new_item.content_type:
-            existing.content_type = new_item.content_type
-        if new_item.validation_note:
-            existing.validation_note = new_item.validation_note
-
-
-def _collect_candidates(
-    base_capture: CaptureResult,
-    probe: bool,
-    headed: bool,
-    wait_seconds: int,
-    extra_wait: int,
-) -> tuple[list[StreamCandidate], dict[str, int]]:
-    merged: OrderedDict[str, StreamCandidate] = OrderedDict()
-    stage_counts: dict[str, int] = {}
-
-    main_candidates = detect_candidates(
-        capture=base_capture, probe=probe, host_bonuses=DEFAULT_HOST_BONUSES
-    )
-    _merge_candidates(merged, main_candidates, "main")
-    stage_counts["main"] = len(main_candidates)
-
-    if main_candidates:
-        return sorted(merged.values(), key=lambda x: x.score, reverse=True), stage_counts
-
-    embed_urls = extract_embed_urls(base_capture)
-    stage_counts["embed_urls"] = len(embed_urls)
-
-    if embed_urls:
-        print(f"[i] No direct stream detected. Deep scan {len(embed_urls)} embed URL(s).")
-
-    for embed_idx, embed_url in enumerate(embed_urls[:3], start=1):
-        print(f"[i] Analyze embed: {embed_url}")
-        waits = [max(wait_seconds, 12)]
-        if extra_wait > 0:
-            waits.append(max(wait_seconds, 12) + extra_wait)
-
-        for phase, phase_wait in enumerate(waits, start=1):
-            stage = f"embed{embed_idx}_phase{phase}"
-            if len(waits) > 1:
-                print(f"[i] Embed phase {phase}/{len(waits)} wait={phase_wait}s")
-
-            embed_capture = capture_page(
-                url=embed_url,
-                wait_seconds=phase_wait,
-                headless=not headed,
-                try_play=True,
-            )
-            embed_candidates = detect_candidates(
-                capture=embed_capture, probe=probe, host_bonuses=DEFAULT_HOST_BONUSES
-            )
-            _merge_candidates(merged, embed_candidates, stage)
-            stage_counts[stage] = len(embed_candidates)
-
-    return sorted(merged.values(), key=lambda x: x.score, reverse=True), stage_counts
-
-
-def _probe_duration_seconds(path: Path) -> float | None:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        str(path),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout or "{}")
-        duration = float(data.get("format", {}).get("duration", 0))
-        return duration if duration > 0 else None
-    except Exception:
-        return None
-
-
-def _headers_block_for_ffprobe(capture: CaptureResult, candidate: StreamCandidate) -> str:
-    headers = build_request_headers(capture, candidate.referer)
-    headers.pop("User-Agent", None)
-    if not headers:
-        return ""
-    return "\r\n".join(f"{k}: {v}" for k, v in headers.items()) + "\r\n"
-
-
-def _probe_candidate_media(capture: CaptureResult, candidate: StreamCandidate) -> None:
-    cmd = ["ffprobe", "-v", "error"]
-
-    if capture.user_agent:
-        cmd.extend(["-user_agent", capture.user_agent])
-
-    header_block = _headers_block_for_ffprobe(capture, candidate)
-    if header_block:
-        cmd.extend(["-headers", header_block])
-
-    cmd.extend(
-        [
-            "-show_entries",
-            "format=duration,bit_rate",
-            "-of",
-            "json",
-            candidate.url,
-        ]
-    )
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout or "{}")
-        fmt = data.get("format", {})
-        duration = float(fmt.get("duration", 0) or 0)
-        bitrate = int(float(fmt.get("bit_rate", 0) or 0))
-
-        if duration > 0:
-            candidate.probe_duration = duration
-            if duration < 90:
-                candidate.score -= 45
-            elif duration < 180:
-                candidate.score -= 20
-            candidate.score += min(int(duration / 60), 80)
-        if bitrate > 0:
-            candidate.probe_bitrate = bitrate
-            candidate.score += min(int(bitrate / 500_000), 25)
-    except Exception:
-        return
-
-
-def _rank_candidates_with_ffprobe(
-    capture: CaptureResult,
-    candidates: list[StreamCandidate],
-    top_n: int,
-) -> list[StreamCandidate]:
-    for candidate in candidates[: max(top_n, 0)]:
-        _probe_candidate_media(capture, candidate)
-    return sorted(candidates, key=lambda x: x.score, reverse=True)
-
-
-def _boost_preferred_hosts(candidates: list[StreamCandidate], prefer_hosts: list[str]) -> list[StreamCandidate]:
-    if not prefer_hosts:
-        return candidates
-
-    normalized = [h.lower().strip() for h in prefer_hosts if h.strip()]
-    if not normalized:
-        return candidates
-
-    for candidate in candidates:
-        host = (candidate.host or "").lower()
-        if any(host == h or host.endswith(f".{h}") for h in normalized):
-            candidate.score += 35
-
-    return sorted(candidates, key=lambda x: x.score, reverse=True)
-
-
 def _serialize_candidates(candidates: list[StreamCandidate]) -> list[dict]:
     return [c.to_dict() for c in candidates]
 
 
 def _interactive_reorder(candidates: list[StreamCandidate]) -> list[StreamCandidate]:
+    """Prompt for a candidate choice.
+
+    Stays in the CLI: it reads stdin, and the pipeline must never be able to
+    block on a terminal.
+    """
     if not candidates:
         return candidates
 
@@ -287,126 +99,27 @@ def _interactive_reorder(candidates: list[StreamCandidate]) -> list[StreamCandid
     return [candidates[idx]] + candidates[:idx] + candidates[idx + 1 :]
 
 
-def _download_with_fallback(
-    capture: CaptureResult,
-    candidates: list[StreamCandidate],
-    pick: int,
-    output_dir: Path,
-    max_attempts: int,
-    min_duration: int,
-    interactive_pick: bool,
-    metadata_capture: CaptureResult | None = None,
-) -> int:
-    start = pick - 1 if pick > 0 and pick <= len(candidates) else 0
-    ordered = candidates[start:] + candidates[:start]
-
-    if interactive_pick:
-        ordered = _interactive_reorder(ordered)
-
-    attempts = min(max_attempts, len(ordered))
-
-    last_error: Exception | None = None
-    for idx, selected in enumerate(ordered[:attempts], start=1):
-        print(f"[+] Try {idx}/{attempts}: {selected.kind} | {selected.url}")
-        try:
-            out_file = download_with_ffmpeg(
-                capture=capture,
-                candidate=selected,
-                output_dir=output_dir,
-                metadata_capture=metadata_capture,
-            )
-            duration = _probe_duration_seconds(out_file)
-            if duration is not None and duration < float(min_duration):
-                print(
-                    f"[!] Reject short output ({duration:.1f}s < {min_duration}s). "
-                    "Try next candidate."
-                )
-                try:
-                    out_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                continue
-            print(f"[+] Downloaded: {out_file}")
-            return 0
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            print(f"[!] Failed candidate: {exc}")
-
-    print("[!] All candidate attempts failed.")
-    if last_error:
-        print(f"[!] Last error: {last_error}")
-    return 3
+def _pipeline_options(args: argparse.Namespace) -> PipelineOptions:
+    return PipelineOptions.from_args(args, host_bonuses=DEFAULT_HOST_BONUSES)
 
 
-def _prepare_candidates(
-    capture: CaptureResult,
-    probe: bool,
-    headed: bool,
-    wait_seconds: int,
-    extra_wait: int,
-    allow_hosts: list[str],
-    precheck_hls: bool,
-    rank_with_ffprobe: bool,
-    rank_top_n: int,
-    prefer_hosts: list[str],
-) -> tuple[list[StreamCandidate], dict[str, int], list[StreamCandidate]]:
-    all_candidates, stage_counts = _collect_candidates(
-        base_capture=capture,
-        probe=probe,
-        headed=headed,
-        wait_seconds=wait_seconds,
-        extra_wait=extra_wait,
+def _reorder_for(args: argparse.Namespace):
+    return _interactive_reorder if getattr(args, "interactive_pick", False) else None
+
+
+def _dump_candidates(args: argparse.Namespace, stage_counts, all_candidates, candidates) -> None:
+    target = getattr(args, "dump_all_candidates", "")
+    if not target:
+        return
+    save_json(
+        {
+            "stage_counts": stage_counts,
+            "all_candidates": _serialize_candidates(all_candidates),
+            "final_candidates": _serialize_candidates(candidates),
+        },
+        Path(target),
     )
-
-    selected = list(all_candidates)
-
-    if allow_hosts:
-        before = len(selected)
-        selected = filter_candidates_by_host(selected, allow_hosts)
-        print(f"[i] allow-host filter: {before} -> {len(selected)}")
-
-    if prefer_hosts and selected:
-        selected = _boost_preferred_hosts(selected, prefer_hosts)
-        print(f"[i] prefer-host boost applied: {', '.join(prefer_hosts)}")
-
-    if precheck_hls and selected:
-        selected = precheck_hls_candidates(selected, capture)
-
-    if rank_with_ffprobe and selected:
-        selected = _rank_candidates_with_ffprobe(capture, selected, rank_top_n)
-
-    return selected, stage_counts, all_candidates
-
-
-def _resolve_download_capture(
-    base_capture: CaptureResult,
-    candidates: list[StreamCandidate],
-    headed: bool,
-    wait_seconds: int,
-) -> CaptureResult:
-    if not candidates:
-        return base_capture
-
-    top = candidates[0]
-    if "embed" not in (top.source or ""):
-        return base_capture
-
-    embed_urls = extract_embed_urls(base_capture)
-    if not embed_urls:
-        return base_capture
-
-    embed_url = embed_urls[0]
-    print(f"[i] Refresh embed capture context for download: {embed_url}")
-    try:
-        return capture_page(
-            url=embed_url,
-            wait_seconds=max(wait_seconds, 15),
-            headless=not headed,
-            try_play=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[!] Embed recapture failed, fallback to base capture: {exc}")
-        return base_capture
+    print(f"[+] Saved dump: {target}")
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
@@ -425,29 +138,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 def cmd_detect(args: argparse.Namespace) -> int:
     _apply_autonomous_overrides(args)
     capture = load_capture(Path(args.capture))
-    candidates, stage_counts, all_candidates = _prepare_candidates(
-        capture=capture,
-        probe=not args.no_probe,
-        headed=args.headed,
-        wait_seconds=args.wait,
-        extra_wait=args.extra_wait,
-        allow_hosts=args.allow_host,
-        precheck_hls=not args.no_precheck_hls,
-        rank_with_ffprobe=not args.no_rank_with_ffprobe,
-        rank_top_n=args.rank_top_n,
-        prefer_hosts=args.prefer_host,
+    candidates, stage_counts, all_candidates = prepare_candidates(
+        capture, _pipeline_options(args), print_event
     )
 
     save_candidates(candidates, Path(args.candidates_out))
-    if args.dump_all_candidates:
-        save_json(
-            {
-                "stage_counts": stage_counts,
-                "all_candidates": _serialize_candidates(all_candidates),
-                "final_candidates": _serialize_candidates(candidates),
-            },
-            Path(args.dump_all_candidates),
-        )
+    _dump_candidates(args, stage_counts, all_candidates, candidates)
 
     print(f"[+] Candidates: {len(candidates)}")
     for idx, candidate in enumerate(candidates[:20], start=1):
@@ -456,109 +152,42 @@ def cmd_detect(args: argparse.Namespace) -> int:
             f"status={candidate.status_code} url={candidate.url}"
         )
     print(f"[+] Saved candidates: {args.candidates_out}")
-    if args.dump_all_candidates:
-        print(f"[+] Saved dump: {args.dump_all_candidates}")
     return 0
 
 
 def cmd_download(args: argparse.Namespace) -> int:
     _apply_autonomous_overrides(args)
     capture = load_capture(Path(args.capture))
-    candidates, stage_counts, all_candidates = _prepare_candidates(
-        capture=capture,
-        probe=not args.no_probe,
-        headed=args.headed,
-        wait_seconds=args.wait,
-        extra_wait=args.extra_wait,
-        allow_hosts=args.allow_host,
-        precheck_hls=not args.no_precheck_hls,
-        rank_with_ffprobe=not args.no_rank_with_ffprobe,
-        rank_top_n=args.rank_top_n,
-        prefer_hosts=args.prefer_host,
-    )
+    options = _pipeline_options(args)
 
-    if args.dump_all_candidates:
-        save_json(
-            {
-                "stage_counts": stage_counts,
-                "all_candidates": _serialize_candidates(all_candidates),
-                "final_candidates": _serialize_candidates(candidates),
-            },
-            Path(args.dump_all_candidates),
-        )
-        print(f"[+] Saved dump: {args.dump_all_candidates}")
+    candidates, stage_counts, all_candidates = prepare_candidates(capture, options, print_event)
+    _dump_candidates(args, stage_counts, all_candidates, candidates)
 
     if not candidates:
         print("[!] No stream candidate found.")
         return 2
 
-    download_capture = _resolve_download_capture(
-        base_capture=capture,
-        candidates=candidates,
-        headed=args.headed,
-        wait_seconds=args.wait,
-    )
-
-    return _download_with_fallback(
+    download_capture = resolve_download_capture(capture, candidates, options, print_event)
+    return download_with_fallback(
         download_capture,
         candidates,
-        args.pick,
-        Path(args.output_dir),
-        args.max_attempts,
-        args.min_duration,
-        args.interactive_pick,
+        options,
         metadata_capture=capture,
+        on_event=print_event,
+        reorder=_reorder_for(args),
     )
 
 
 def _run_capture_pipeline(args: argparse.Namespace, capture: CaptureResult) -> int:
     save_capture(capture, Path(args.capture_out))
-    candidates, stage_counts, all_candidates = _prepare_candidates(
-        capture=capture,
-        probe=not args.no_probe,
-        headed=args.headed,
-        wait_seconds=args.wait,
-        extra_wait=args.extra_wait,
-        allow_hosts=args.allow_host,
-        precheck_hls=not args.no_precheck_hls,
-        rank_with_ffprobe=not args.no_rank_with_ffprobe,
-        rank_top_n=args.rank_top_n,
-        prefer_hosts=args.prefer_host,
+    options = _pipeline_options(args)
+
+    code, candidates, stage_counts, all_candidates = pipeline_run(
+        capture, options, print_event, reorder=_reorder_for(args)
     )
     save_candidates(candidates, Path(args.candidates_out))
-
-    if args.dump_all_candidates:
-        save_json(
-            {
-                "stage_counts": stage_counts,
-                "all_candidates": _serialize_candidates(all_candidates),
-                "final_candidates": _serialize_candidates(candidates),
-            },
-            Path(args.dump_all_candidates),
-        )
-        print(f"[+] Saved dump: {args.dump_all_candidates}")
-
-    if not candidates:
-        print("[!] No stream candidate found after analysis.")
-        return 2
-
-    download_capture = _resolve_download_capture(
-        base_capture=capture,
-        candidates=candidates,
-        headed=args.headed,
-        wait_seconds=args.wait,
-    )
-
-    return _download_with_fallback(
-        download_capture,
-        candidates,
-        args.pick,
-        Path(args.output_dir),
-        args.max_attempts,
-        args.min_duration,
-        args.interactive_pick,
-        metadata_capture=capture,
-    )
+    _dump_candidates(args, stage_counts, all_candidates, candidates)
+    return code
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -722,7 +351,7 @@ def cmd_probe_batch(args: argparse.Namespace) -> int:
         print("             (list was capped; more items exist)")
 
     if not result.is_batchable:
-        print(f"batchable  : no")
+        print("batchable  : no")
         print(f"reason     : {result.reason}")
         return 2
 

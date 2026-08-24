@@ -273,7 +273,6 @@ def discover_quatvn_targets(
 ) -> list[str]:
     driver = _build_driver(headless=headless)
     discovered: OrderedDict[str, None] = OrderedDict()
-    token = collection_slug_token(page_url)
 
     try:
         driver.get(page_url)
