@@ -2,12 +2,19 @@
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from .console import print_event
 from .core.capture import capture_page
 from .sites.flowplayer import download_collection, fetch_collection, parse_flowplayer_collection
-from .crawl import crawl_preset_choices, crawl_site_links, resolve_crawl_preset, save_urls_to_csv
+from .crawl import (
+    crawl_preset_choices,
+    crawl_site_links,
+    read_csv_urls,
+    resolve_crawl_preset,
+    save_urls_to_csv,
+)
 from .core.io import load_capture, save_candidates, save_capture, save_json
 from .core.models import CaptureResult, StreamCandidate
 from .core.options import PipelineOptions
@@ -32,6 +39,10 @@ from .engines.chain import resolve_by_engine
 from .engines.ytdlp_resolver import YtDlpOptions
 from .core.resolvers import capture_from_resolution
 from .hosts import DEFAULT_HOST_BONUSES
+from .jobs.bus import EventBus
+from .jobs.manager import DEFAULT_CONCURRENCY, DuplicateJob, JobManager
+from .jobs.models import TERMINAL_STATUSES, JobStatus
+from .jobs.store import JobStore
 from .sites import plugin_names
 
 
@@ -369,6 +380,148 @@ def cmd_probe_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _open_manager(args: argparse.Namespace):
+    """Build a manager over the real store. Caller must shut it down."""
+    store = JobStore(getattr(args, "db", None) or None)
+    bus = EventBus()
+    manager = JobManager(
+        store=store,
+        bus=bus,
+        options=_pipeline_options(args),
+        concurrency=getattr(args, "concurrency", DEFAULT_CONCURRENCY),
+    )
+    return manager, store
+
+
+def _print_jobs(jobs) -> None:
+    if not jobs:
+        print("(no jobs)")
+        return
+    for job in jobs:
+        percent = f"{job.percent:5.1f}%" if job.percent is not None else "    ?"
+        print(f"{job.id[:8]}  {job.status.value:13} {percent}  {job.title or job.url}")
+        if job.error:
+            print(f"          error: {job.error}")
+
+
+def _drain_until_idle(manager, store, job_ids: list[str], timeout: float) -> int:
+    """Block until the given jobs leave the active statuses."""
+    deadline = time.monotonic() + timeout
+    pending = set(job_ids)
+    while pending and time.monotonic() < deadline:
+        for job_id in list(pending):
+            job = store.get(job_id)
+            if job is None or job.status in TERMINAL_STATUSES:
+                pending.discard(job_id)
+        if pending:
+            time.sleep(0.5)
+
+    failed = 0
+    for job_id in job_ids:
+        job = store.get(job_id)
+        if job is None:
+            continue
+        if job.status == JobStatus.COMPLETED:
+            print(f"[+] {job.id[:8]} {job.output_path}")
+        else:
+            failed += 1
+            print(f"[!] {job.id[:8]} {job.status.value}: {job.error or ''}")
+    return failed
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    manager, store = _open_manager(args)
+    try:
+        if args.queue_action == "list":
+            _print_jobs(store.list(status=args.status or None))
+            counts = store.counts_by_status()
+            if counts:
+                print("counts: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            return 0
+
+        if args.queue_action == "add":
+            urls = [url for url in args.url if url.strip()]
+            job_ids = []
+            for url in urls:
+                try:
+                    job = manager.submit(url)
+                except DuplicateJob as exc:
+                    print(f"[!] skip {url}: {exc}")
+                    continue
+                job_ids.append(job.id)
+                print(f"[+] queued {job.id[:8]} {url}")
+            if not job_ids:
+                return 2
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, job_ids, args.timeout) else 0
+            return 0
+
+        if args.queue_action == "batch":
+            result = batch_probe(args.url)
+            if not result.is_batchable:
+                print(f"[!] not batchable: {result.reason}")
+                return 2
+            if result.confidence == "possible" and not args.accept_possible:
+                print(f"[!] {len(result.items)} link(s) found, but these are page links, not confirmed media.")
+                print("[i] Re-run with --accept-possible to queue them anyway.")
+                return 2
+            items = result.items[: args.limit] if args.limit else result.items
+            batch, jobs, skipped = manager.submit_batch(
+                items,
+                source_url=args.url,
+                capability=result.capability,
+                confidence=result.confidence,
+            )
+            print(f"[+] batch {batch.id[:8]}: queued {len(jobs)}, skipped {len(skipped)}")
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, [j.id for j in jobs], args.timeout) else 0
+            return 0
+
+        if args.queue_action == "cancel":
+            return 0 if manager.cancel(args.job_id) else 2
+
+        if args.queue_action == "retry":
+            job = manager.retry(args.job_id)
+            if job is None:
+                print(f"[!] unknown job: {args.job_id}")
+                return 2
+            print(f"[+] requeued {job.id[:8]}")
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, [job.id], args.timeout) else 0
+            return 0
+
+        if args.queue_action == "import-csv":
+            urls = read_csv_urls(Path(args.csv))
+            print(f"[i] {len(urls)} URL(s) in {args.csv}")
+            if args.dry_run:
+                for url in urls[:40]:
+                    print(f"  would queue: {url}")
+                if len(urls) > 40:
+                    print(f"  ... ({len(urls) - 40} more)")
+                return 0
+            job_ids = []
+            for url in urls:
+                try:
+                    job_ids.append(manager.submit(url).id)
+                except DuplicateJob:
+                    continue
+            print(f"[+] queued {len(job_ids)} job(s)")
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, job_ids, args.timeout) else 0
+            return 0
+
+        if args.queue_action == "recover":
+            recovered = manager.recover_interrupted()
+            print(f"[i] marked {len(recovered)} job(s) interrupted")
+            return 0
+
+        print(f"[!] unknown queue action: {args.queue_action}")
+        return 2
+    finally:
+        manager.shutdown()
+        store.close()
+
+
 def _add_selection_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-host", action="append", default=[], help="Allow only candidates from this host (repeatable)")
     parser.add_argument("--prefer-host", action="append", default=[], help="Boost candidates from this host (repeatable)")
@@ -475,6 +628,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.add_argument("url", help="Page URL you are authorized to analyze")
     p_probe.add_argument("--verify", type=int, default=0, help="Fully resolve the first N items to raise confidence")
     p_probe.set_defaults(func=cmd_probe_batch)
+
+    p_queue = sub.add_parser("queue", help="Manage the persistent download queue")
+    p_queue.add_argument("--db", default="", help="Job database path (default: the state directory)")
+    p_queue.add_argument("--output-dir", default="output", help="Where finished media goes")
+    p_queue.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="How many jobs run at once")
+    queue_sub = p_queue.add_subparsers(dest="queue_action", required=True)
+
+    q_add = queue_sub.add_parser("add", help="Queue one or more URLs")
+    q_add.add_argument("url", nargs="+", help="URLs you are authorized to download")
+    q_add.add_argument("--wait", action="store_true", help="Block until the queued jobs finish")
+    q_add.add_argument("--timeout", type=float, default=3600.0, help="Seconds to wait when --wait is used")
+
+    q_batch = queue_sub.add_parser("batch", help="Probe a URL and queue every item it enumerates")
+    q_batch.add_argument("url", help="Playlist, collection, or listing URL")
+    q_batch.add_argument("--limit", type=int, default=0, help="Queue at most N items (0 = all)")
+    q_batch.add_argument(
+        "--accept-possible",
+        action="store_true",
+        help="Also queue crawl-derived links, which are page links rather than confirmed media",
+    )
+    q_batch.add_argument("--wait", action="store_true", help="Block until the queued jobs finish")
+    q_batch.add_argument("--timeout", type=float, default=7200.0, help="Seconds to wait when --wait is used")
+
+    q_list = queue_sub.add_parser("list", help="Show queued and finished jobs")
+    q_list.add_argument("--status", default="", help="Filter by status")
+
+    q_cancel = queue_sub.add_parser("cancel", help="Cancel a job")
+    q_cancel.add_argument("job_id", help="Job id")
+
+    q_retry = queue_sub.add_parser("retry", help="Requeue a failed or interrupted job")
+    q_retry.add_argument("job_id", help="Job id")
+    q_retry.add_argument("--wait", action="store_true", help="Block until the job finishes")
+    q_retry.add_argument("--timeout", type=float, default=3600.0, help="Seconds to wait when --wait is used")
+
+    q_import = queue_sub.add_parser("import-csv", help="Queue every URL in a crawl CSV")
+    q_import.add_argument("csv", help="CSV produced by crawl-links")
+    q_import.add_argument("--dry-run", action="store_true", help="List what would be queued")
+    q_import.add_argument("--wait", action="store_true", help="Block until the queued jobs finish")
+    q_import.add_argument("--timeout", type=float, default=7200.0, help="Seconds to wait when --wait is used")
+
+    queue_sub.add_parser("recover", help="Mark jobs left running by a dead process as interrupted")
+
+    p_queue.set_defaults(func=cmd_queue)
 
     p_crawl = sub.add_parser("crawl-links", help="Crawl a website and export discovered child URLs to CSV")
     p_crawl.add_argument("url", help="Start URL to crawl")

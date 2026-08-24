@@ -172,3 +172,22 @@ def save_urls_to_csv(urls: Iterable[str], output_path: Path) -> None:
         writer.writerow(["url"])
         for url in urls:
             writer.writerow([url])
+
+
+def read_csv_urls(path: Path) -> list[str]:
+    """Read the url column from a crawl CSV, preserving order and skipping blanks."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if reader.fieldnames and "url" in reader.fieldnames:
+            rows = ((row.get("url") or "").strip() for row in reader)
+        else:
+            csv_file.seek(0)
+            rows = ((row[0] if row else "").strip() for row in csv.reader(csv_file))
+        for url in rows:
+            if not url or url.lower() == "url" or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return urls
