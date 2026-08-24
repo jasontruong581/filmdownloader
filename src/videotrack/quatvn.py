@@ -6,8 +6,8 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urldefrag, urlparse
 
-from .capture import _build_driver, _try_play_in_current_context, selenium_api
-from .models import CaptureResult, StreamCandidate
+from .core.capture import _build_driver, _try_play_in_current_context, selenium_api
+from .core.models import CaptureResult, StreamCandidate
 
 
 def is_quatvn_url(url: str) -> bool:

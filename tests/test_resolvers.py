@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from videotrack import cli
-from videotrack.resolvers import Resolution, ResolvedMedia, capture_from_resolution
+from videotrack.core.resolvers import Resolution, ResolvedMedia, capture_from_resolution
 from videotrack.static_player import StaticPlayerResolver
 
 

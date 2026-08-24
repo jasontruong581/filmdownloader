@@ -12,7 +12,7 @@ import unittest
 from collections import OrderedDict
 
 from videotrack.cli import _merge_candidates
-from videotrack.models import StreamCandidate
+from videotrack.core.models import StreamCandidate
 
 
 def _candidate(

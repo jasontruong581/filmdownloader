@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import unittest
 
-from videotrack.detect import detect_candidates
-from videotrack.models import CaptureResult, NetworkRequest
+from videotrack.core.detect import detect_candidates
+from videotrack.core.models import CaptureResult, NetworkRequest
 
 
 def _capture(*requests: NetworkRequest) -> CaptureResult:

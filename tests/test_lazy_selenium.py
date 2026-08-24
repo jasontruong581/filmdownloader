@@ -26,14 +26,24 @@ for _name in ("selenium", "selenium.webdriver", "selenium.webdriver.chrome.optio
 
 MODULES_THAT_MUST_IMPORT = [
     "videotrack.cli",
-    "videotrack.capture",
+    "videotrack.core",
+    "videotrack.core.capture",
+    "videotrack.core.detect",
+    "videotrack.core.download",
+    "videotrack.core.io",
+    "videotrack.core.models",
+    "videotrack.core.resolvers",
     "videotrack.quatvn",
-    "videotrack.detect",
-    "videotrack.download",
-    "videotrack.resolvers",
     "videotrack.static_player",
     "videotrack.collection",
     "videotrack.crawl",
+    # Deprecated re-export paths must stay import-safe while they exist.
+    "videotrack.capture",
+    "videotrack.detect",
+    "videotrack.download",
+    "videotrack.io",
+    "videotrack.models",
+    "videotrack.resolvers",
 ]
 
 
@@ -76,7 +86,7 @@ class LazySeleniumTests(unittest.TestCase):
     def test_selenium_api_raises_a_helpful_runtime_error(self) -> None:
         result = _run_without_selenium(
             """
-            from videotrack.capture import selenium_api
+            from videotrack.core.capture import selenium_api
             try:
                 selenium_api()
             except RuntimeError as exc:

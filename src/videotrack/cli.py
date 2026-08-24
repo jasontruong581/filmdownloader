@@ -7,20 +7,20 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 
-from .capture import capture_page
+from .core.capture import capture_page
 from .collection import download_collection, fetch_collection, parse_flowplayer_collection
 from .crawl import crawl_site_links, resolve_crawl_preset, save_urls_to_csv
-from .detect import (
+from .core.detect import (
     build_request_headers,
     detect_candidates,
     extract_embed_urls,
     filter_candidates_by_host,
     precheck_hls_candidates,
 )
-from .download import download_with_ffmpeg
-from .io import load_capture, save_candidates, save_capture, save_json
-from .models import CaptureResult, StreamCandidate
-from .resolvers import capture_from_resolution
+from .core.download import download_with_ffmpeg
+from .core.io import load_capture, save_candidates, save_capture, save_json
+from .core.models import CaptureResult, StreamCandidate
+from .core.resolvers import capture_from_resolution
 from .static_player import StaticPlayerResolver
 
 

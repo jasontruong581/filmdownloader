@@ -12,13 +12,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from videotrack.download import (
+from videotrack.core.download import (
     _extract_page_id,
     _quatvn_asset_suffix,
     _safe_name,
     output_path_for,
 )
-from videotrack.models import CaptureResult
+from videotrack.core.models import CaptureResult
 
 
 def _capture(title: str = "", final_url: str = "https://page.example.test/watch/123") -> CaptureResult:

@@ -13,8 +13,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from videotrack.capture import capture_page
-from videotrack.download import download_with_ffmpeg
+from videotrack.core.capture import capture_page
+from videotrack.core.download import download_with_ffmpeg
 from videotrack.quatvn import discover_quatvn_targets, extract_quatvn_stream_candidates, is_quatvn_stream_url, is_quatvn_url
 
 BASE_FIELDNAMES = ["order", "id", "proceed_status", "url", "target_count", "completed_count", "last_error"]

@@ -7,7 +7,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 
-from .resolvers import DEFAULT_USER_AGENT, Resolution, ResolvedMedia, media_kind
+from .core.resolvers import DEFAULT_USER_AGENT, Resolution, ResolvedMedia, media_kind
 
 MEDIA_URL_RE = re.compile(r"https?://[^\"'\s<>]+(?:m3u8|mp4|mpd)[^\"'\s<>]*", re.IGNORECASE)
 

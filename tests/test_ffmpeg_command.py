@@ -10,8 +10,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from videotrack.download import _headers_block, build_ffmpeg_command
-from videotrack.models import CaptureResult, StreamCandidate
+from videotrack.core.download import _headers_block, build_ffmpeg_command
+from videotrack.core.models import CaptureResult, StreamCandidate
 
 OUT = Path("output") / "clip.mp4"
 

@@ -9,9 +9,9 @@ from urllib.parse import urlparse
 
 import requests
 
-from .download import download_with_ffmpeg
-from .models import CaptureResult, StreamCandidate
-from .resolvers import DEFAULT_USER_AGENT, media_kind
+from .core.download import download_with_ffmpeg
+from .core.models import CaptureResult, StreamCandidate
+from .core.resolvers import DEFAULT_USER_AGENT, media_kind
 
 
 @dataclass(frozen=True)
