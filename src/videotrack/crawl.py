@@ -10,6 +10,8 @@ from urllib.parse import urljoin, urldefrag, urlparse
 
 import requests
 
+from .core.models import CrawlPreset
+
 
 class _AnchorParser(HTMLParser):
     def __init__(self) -> None:
@@ -29,14 +31,6 @@ class _AnchorParser(HTMLParser):
 class CrawlResult:
     matched_urls: list[str]
     visited_pages: int
-
-
-@dataclass(frozen=True)
-class CrawlPreset:
-    name: str
-    include_substring: str
-    exclude_substrings: tuple[str, ...] = ()
-    url_filter: Callable[[str, str], bool] | None = None
 
 
 def _normalize_url(raw_url: str, base_url: str) -> str | None:
@@ -70,75 +64,38 @@ def _normalize_path(path: str) -> str:
     return path.lower()
 
 
-def _quatvn_url_filter(url: str, host: str) -> bool:
-    parsed = urlparse(url)
-    if parsed.netloc.lower() != host:
-        return False
-    if parsed.query:
-        return False
-
-    path = _normalize_path(parsed.path)
-    if path == "/":
-        return False
-
-    reserved_segments = {
-        "category",
-        "danh-muc",
-        "feed",
-        "page",
-        "search",
-        "tag",
-        "wp-admin",
-        "wp-content",
-        "wp-includes",
-        "wp-json",
-    }
-    segments = [segment for segment in path.strip("/").split("/") if segment]
-    if not segments:
-        return False
-    if any(segment.lower() in reserved_segments for segment in segments):
-        return False
-
-    last_segment = segments[-1]
-    if "." in last_segment:
-        return False
-    return True
-
-
 def resolve_crawl_preset(start_url: str, site_preset: str = "auto") -> CrawlPreset:
+    """Pick link-discovery rules for a start URL.
+
+    Rules come from the site registry, so adding a plugin adds a preset. Only the
+    host-neutral `generic` fallback is defined here.
+    """
+    from .sites import crawl_preset_for, crawl_preset_named, crawl_preset_names
+
     normalized_start = _normalize_url(start_url, start_url)
     if not normalized_start:
         raise ValueError("Invalid start URL.")
 
-    host = urlparse(normalized_start).netloc.lower()
-    presets: dict[str, CrawlPreset] = {
-        "generic": CrawlPreset(name="generic", include_substring=""),
-        "vlxx": CrawlPreset(name="vlxx", include_substring="/video/"),
-        "quatvn": CrawlPreset(
-            name="quatvn",
-            include_substring="",
-            exclude_substrings=(
-                "/author/",
-                "/danh-muc/",
-                "/feed/",
-                "/page/",
-                "/tag/",
-                "/wp-",
-            ),
-            url_filter=_quatvn_url_filter,
-        ),
-    }
+    generic = CrawlPreset(name="generic", include_substring="")
 
     if site_preset == "auto":
-        if host.startswith("vlxx."):
-            return presets["vlxx"]
-        if host == "quatvn.my" or host.endswith(".quatvn.my"):
-            return presets["quatvn"]
-        return presets["generic"]
+        return crawl_preset_for(normalized_start) or generic
 
-    if site_preset not in presets:
-        raise ValueError(f"Unsupported crawl preset: {site_preset}")
-    return presets[site_preset]
+    if site_preset == "generic":
+        return generic
+
+    preset = crawl_preset_named(site_preset)
+    if preset is None:
+        known = ", ".join(("auto", "generic", *crawl_preset_names()))
+        raise ValueError(f"Unsupported crawl preset: {site_preset}. Known presets: {known}")
+    return preset
+
+
+def crawl_preset_choices() -> tuple[str, ...]:
+    """Preset names accepted on the command line, discovered at runtime."""
+    from .sites import crawl_preset_names
+
+    return ("auto", "generic", *crawl_preset_names())
 
 
 def _matches_target_link(

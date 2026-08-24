@@ -8,8 +8,8 @@ from collections import OrderedDict
 from pathlib import Path
 
 from .core.capture import capture_page
-from .collection import download_collection, fetch_collection, parse_flowplayer_collection
-from .crawl import crawl_site_links, resolve_crawl_preset, save_urls_to_csv
+from .sites.flowplayer import download_collection, fetch_collection, parse_flowplayer_collection
+from .crawl import crawl_preset_choices, crawl_site_links, resolve_crawl_preset, save_urls_to_csv
 from .core.detect import (
     build_request_headers,
     detect_candidates,
@@ -20,8 +20,12 @@ from .core.detect import (
 from .core.download import download_with_ffmpeg
 from .core.io import load_capture, save_candidates, save_capture, save_json
 from .core.models import CaptureResult, StreamCandidate
+from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
+from .engines import ytdlp_version
 from .core.resolvers import capture_from_resolution
-from .static_player import StaticPlayerResolver
+from .hosts import DEFAULT_HOST_BONUSES
+from .sites import plugin_names
+from .sites.vlxx import StaticPlayerResolver
 
 
 def _add_shared_capture_args(parser: argparse.ArgumentParser) -> None:
@@ -101,7 +105,9 @@ def _collect_candidates(
     merged: OrderedDict[str, StreamCandidate] = OrderedDict()
     stage_counts: dict[str, int] = {}
 
-    main_candidates = detect_candidates(capture=base_capture, probe=probe)
+    main_candidates = detect_candidates(
+        capture=base_capture, probe=probe, host_bonuses=DEFAULT_HOST_BONUSES
+    )
     _merge_candidates(merged, main_candidates, "main")
     stage_counts["main"] = len(main_candidates)
 
@@ -131,7 +137,9 @@ def _collect_candidates(
                 headless=not headed,
                 try_play=True,
             )
-            embed_candidates = detect_candidates(capture=embed_capture, probe=probe)
+            embed_candidates = detect_candidates(
+                capture=embed_capture, probe=probe, host_bonuses=DEFAULT_HOST_BONUSES
+            )
             _merge_candidates(merged, embed_candidates, stage)
             stage_counts[stage] = len(embed_candidates)
 
@@ -613,6 +621,38 @@ def cmd_collect(args: argparse.Namespace) -> int:
     return 0 if completed == manifest["expected_count"] else 3
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    statuses = check_tools()
+
+    print("External tools")
+    print(format_report(statuses))
+
+    print("\nOptional Python packages")
+    ytdlp = ytdlp_version()
+    if ytdlp:
+        print(f"[ok  ] yt-dlp       {ytdlp}")
+        print("            extractors go stale quickly: pip install -U yt-dlp")
+    else:
+        print("[--  ] yt-dlp       not installed (optional)")
+
+    print("\nSite plugins")
+    print(f"  registered: {', '.join(plugin_names()) or 'none'}")
+    print(f"  crawl presets: {', '.join(crawl_preset_choices())}")
+
+    location = ffmpeg_location()
+    if location is not None:
+        print(f"\nFFmpeg location override: {location}")
+
+    blocking = [status.name for status in statuses if status.blocking]
+    if blocking:
+        print(f"\n[!] Missing required tool(s): {', '.join(blocking)}")
+        print(f"[i] Set {ENV_FFMPEG} to an ffmpeg directory or executable if it is installed elsewhere.")
+        return 1
+
+    print("\nAll required tools available.")
+    return 0
+
+
 def _add_selection_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-host", action="append", default=[], help="Allow only candidates from this host (repeatable)")
     parser.add_argument("--prefer-host", action="append", default=[], help="Boost candidates from this host (repeatable)")
@@ -687,12 +727,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_selection_flags(p_run)
     p_run.set_defaults(func=cmd_run)
 
+    p_doctor = sub.add_parser("doctor", help="Report external tool and plugin availability")
+    p_doctor.set_defaults(func=cmd_doctor)
+
     p_crawl = sub.add_parser("crawl-links", help="Crawl a website and export discovered child URLs to CSV")
     p_crawl.add_argument("url", help="Start URL to crawl")
     p_crawl.add_argument("--output-csv", default="output/links.csv", help="CSV output path")
     p_crawl.add_argument(
         "--site-preset",
-        choices=["auto", "generic", "vlxx", "quatvn"],
+        choices=list(crawl_preset_choices()),
         default="auto",
         help="Apply site-specific crawl rules. Default: auto-detect from the input URL host",
     )

@@ -13,6 +13,7 @@ import unittest
 
 from videotrack.core.detect import detect_candidates
 from videotrack.core.models import CaptureResult, NetworkRequest
+from videotrack.hosts import DEFAULT_HOST_BONUSES
 
 
 def _capture(*requests: NetworkRequest) -> CaptureResult:
@@ -176,10 +177,20 @@ class PenaltyAndBonusTests(unittest.TestCase):
 
         self.assertEqual(candidates[0].score, 60)
 
-    def test_stream_host_bonus_is_applied(self) -> None:
-        candidates = detect_candidates(_capture(_request("https://v1.tiktokcdn.com/a.mp4")), probe=False)
+    def test_shipped_host_bonus_is_applied_when_passed(self) -> None:
+        candidates = detect_candidates(
+            _capture(_request("https://v1.tiktokcdn.com/a.mp4")),
+            probe=False,
+            host_bonuses=DEFAULT_HOST_BONUSES,
+        )
 
         self.assertEqual(candidates[0].score, 98)
+
+    def test_no_host_bonus_is_applied_by_default(self) -> None:
+        # Core carries no hostnames of its own; bonuses are caller-supplied data.
+        candidates = detect_candidates(_capture(_request("https://v1.tiktokcdn.com/a.mp4")), probe=False)
+
+        self.assertEqual(candidates[0].score, 80)
 
     def test_host_is_derived_from_the_url(self) -> None:
         candidates = detect_candidates(_capture(_request("https://CDN.Example.Test/a.mp4")), probe=False)

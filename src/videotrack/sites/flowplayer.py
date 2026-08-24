@@ -9,9 +9,10 @@ from urllib.parse import urlparse
 
 import requests
 
-from .core.download import download_with_ffmpeg
-from .core.models import CaptureResult, StreamCandidate
-from .core.resolvers import DEFAULT_USER_AGENT, media_kind
+from ..core.download import download_with_ffmpeg
+from ..core.models import CaptureResult, StreamCandidate
+from ..core.resolvers import DEFAULT_USER_AGENT, media_kind
+from . import BaseSitePlugin, register
 
 
 @dataclass(frozen=True)
@@ -173,3 +174,21 @@ def download_collection(collection: Collection, output_dir: Path, dry_run: bool,
                 item["error"] = str(exc)
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
+
+
+class FlowplayerPlugin(BaseSitePlugin):
+    """Pages that embed a Flowplayer collection as HTML-encoded data-item entries.
+
+    `handles` stays False: this pattern is identified by page markup, not by
+    hostname, and a URL prefilter must not fetch anything to find out. The plugin
+    contributes through batch probing and the `collect` command instead of
+    through URL routing.
+    """
+
+    name = "flowplayer"
+
+    def handles(self, url: str) -> bool:
+        return False
+
+
+register(FlowplayerPlugin())

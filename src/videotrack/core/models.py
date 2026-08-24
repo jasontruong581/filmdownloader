@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 
@@ -99,3 +99,57 @@ class StreamCandidate:
             "validation_note": self.validation_note,
             "referer": self.referer,
         }
+
+
+@dataclass
+class PageMetadata:
+    """Descriptive fields a site plugin can extract from a page.
+
+    Neutral by design: a plugin fills what its site exposes and leaves the rest
+    as None. Core naming falls back to the page title and then the URL path.
+    """
+
+    video_code: str | None = None
+    title: str | None = None
+    actresses: list[str] | None = None
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class CrawlPreset:
+    """Per-site rules for discovering child URLs on one host."""
+
+    name: str
+    include_substring: str
+    exclude_substrings: tuple[str, ...] = ()
+    url_filter: Callable[[str, str], bool] | None = None
+
+
+@dataclass(frozen=True)
+class BatchItem:
+    """One enumerated entry of a multi-item page."""
+
+    url: str
+    title: str = ""
+
+
+@dataclass(frozen=True)
+class BatchProbe:
+    """The result of asking whether a URL enumerates more than one item.
+
+    A probe proves *enumeration*, never *downloadability*. `confidence` is
+    "proven" only when concrete items were listed, so the UI can show them before
+    enabling anything; "possible" means links were found but no media was
+    confirmed; "none" carries a specific human-readable `reason`.
+    """
+
+    capability: str = "none"
+    confidence: str = "none"
+    items: tuple[BatchItem, ...] = ()
+    total_estimate: int | None = None
+    truncated: bool = False
+    reason: str = ""
+
+    @property
+    def is_batchable(self) -> bool:
+        return self.confidence in {"proven", "possible"} and len(self.items) >= 2

@@ -1,24 +1,23 @@
+"""Download a selected candidate through FFmpeg.
+
+Site-neutral. Metadata extraction, per-site filename quirks, and asset
+conversion are asked of the site registry rather than implemented here, so a
+universal download does not get named from selectors that only exist on one
+site.
+"""
+
 from __future__ import annotations
 
-import html
 import re
 import subprocess
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
-from .models import CaptureResult, StreamCandidate
+from .models import CaptureResult, PageMetadata, StreamCandidate
 
-
-@dataclass
-class PageMetadata:
-    video_code: str | None = None
-    title: str | None = None
-    actresses: list[str] | None = None
-    description: str | None = None
+FFMPEG_STDERR_TAIL_LINES = 12
 
 
 def _safe_name(raw: str) -> str:
@@ -42,30 +41,6 @@ def _extract_page_id(url: str) -> str | None:
     return None
 
 
-def _quatvn_asset_suffix(url: str) -> str:
-    path = urlparse(url).path or ""
-    name = unquote(path.rsplit("/", 1)[-1])
-    match = re.search(r"\((\d+)\)\.webp$", name, re.IGNORECASE)
-    if match:
-        return f"clip-{int(match.group(1)):02d}"
-    stem = Path(name).stem
-    return _safe_name(stem or "clip")
-
-
-def _clean_text(raw: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", raw)
-    text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _first_match(text: str, pattern: str) -> str | None:
-    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    return _clean_text(match.group(1))
-
-
 def _request_headers(capture: CaptureResult, referer: str) -> dict[str, str]:
     headers: dict[str, str] = {
         "User-Agent": capture.user_agent,
@@ -76,64 +51,44 @@ def _request_headers(capture: CaptureResult, referer: str) -> dict[str, str]:
     return headers
 
 
-def fetch_page_metadata(capture: CaptureResult) -> PageMetadata:
-    url = capture.final_url or capture.page_url
-    headers = _request_headers(capture, url)
+def _site_plugin_for(url: str):
+    """Look the registry up lazily to keep core free of a site-package import."""
+    from ..sites import plugin_for
 
+    return plugin_for(url)
+
+
+def _site_plugin_for_kind(kind: str):
+    from ..sites import plugin_for_kind
+
+    return plugin_for_kind(kind)
+
+
+def fetch_page_metadata(capture: CaptureResult, page_html: str | None = None) -> PageMetadata:
+    """Descriptive fields from whichever site plugin claims this page."""
+    plugin = _site_plugin_for(capture.final_url or capture.page_url)
+    if plugin is None:
+        return PageMetadata()
     try:
-        response = requests.get(url, headers=headers, timeout=20)
-    except requests.RequestException:
+        return plugin.metadata(capture, page_html) or PageMetadata()
+    except Exception:  # noqa: BLE001 - naming must never fail a download
         return PageMetadata()
 
-    if not response.ok:
-        return PageMetadata()
 
-    if response.apparent_encoding:
-        response.encoding = response.apparent_encoding
+def unique_path(path: Path) -> Path:
+    """Return `path`, or the first free `name (n).ext` beside it.
 
-    html_text = response.text or ""
-    code = _first_match(
-        html_text,
-        r'<span[^>]*class=["\'][^"\']*video-code[^"\']*["\'][^>]*>(.*?)</span>',
-    )
-    title = _first_match(
-        html_text,
-        r'<h2[^>]*id=["\']page-title["\'][^>]*>(.*?)</h2>',
-    ) or _first_match(
-        html_text,
-        r'<h2[^>]*class=["\'][^"\']*\bpage-title\b[^"\']*["\'][^>]*>(.*?)</h2>',
-    ) or _first_match(
-        html_text,
-        r'<h2[^>]*class=["\'][^"\']*\bbreadcrumb\b[^"\']*["\'][^>]*>(.*?)</h2>',
-    )
-    actresses_match = re.search(
-        r'<div[^>]*class=["\'][^"\']*actress-tag[^"\']*["\'][^>]*>(.*?)</div>',
-        html_text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    description = _first_match(
-        html_text,
-        r'<div[^>]*class=["\'][^"\']*video-description[^"\']*["\'][^>]*>(.*?)</div>',
-    )
-
-    actresses: list[str] = []
-    if actresses_match:
-        raw_block = actresses_match.group(1)
-        actresses = [
-            _clean_text(name)
-            for name in re.findall(r'title=["\']([^"\']+)["\']', raw_block, re.IGNORECASE)
-            if _clean_text(name)
-        ]
-        if not actresses:
-            actresses_plain = _clean_text(raw_block)
-            actresses = [part.strip() for part in re.split(r"\s{2,}|,\s*", actresses_plain) if part.strip()]
-
-    return PageMetadata(
-        video_code=code or None,
-        title=title or None,
-        actresses=actresses or None,
-        description=description or None,
-    )
+    Two pages can easily derive the same name. FFmpeg runs with `-y`, so without
+    this the second download silently overwrites the first, and with concurrent
+    jobs both could write the same file at once.
+    """
+    if not path.exists():
+        return path
+    for counter in range(2, 1000):
+        candidate = path.with_name(f"{path.stem} ({counter}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"could not find a free filename beside {path}")
 
 
 def output_path_for(capture: CaptureResult, output_dir: Path, preferred_base: str | None = None) -> Path:
@@ -151,21 +106,6 @@ def output_path_for(capture: CaptureResult, output_dir: Path, preferred_base: st
         base = f"{base}.mp4"
 
     return output_dir / base
-
-
-def _write_description_file(out_file: Path, metadata: PageMetadata) -> None:
-    sidecar = out_file.with_name(f"{out_file.stem} description.txt")
-
-    title = metadata.title or ""
-    actresses = ", ".join(metadata.actresses or [])
-    description = metadata.description or ""
-
-    content = (
-        f"title: {title}\n"
-        f"acctress: {actresses}\n"
-        f"Description: {description}\n"
-    )
-    sidecar.write_text(content, encoding="utf-8")
 
 
 def _headers_block(capture: CaptureResult, referer: str | None = None) -> str:
@@ -221,119 +161,66 @@ def build_ffmpeg_command(
     return cmd
 
 
-def _run_ffmpeg(cmd: list[str]) -> int:
-    proc = subprocess.run(cmd, capture_output=False, text=True)
-    return proc.returncode
+class ToolNotFound(RuntimeError):
+    """An external binary is not on PATH or at its configured location."""
 
 
-def _download_to_temp_file(capture: CaptureResult, candidate: StreamCandidate, suffix: str) -> Path:
-    headers = _request_headers(capture, capture.final_url or capture.page_url)
-    response = requests.get(candidate.url, headers=headers, timeout=60, stream=True)
-    if not response.ok:
-        raise RuntimeError(f"asset request failed: HTTP {response.status_code}")
+def _run_command(cmd: list[str]) -> int:
+    """Run an external tool, letting its output through to the terminal.
 
-    temp_path = Path("logs") / f"quatvn_asset_{abs(hash(candidate.url))}{suffix}"
-    temp_path.parent.mkdir(parents=True, exist_ok=True)
-    with temp_path.open("wb") as handle:
-        for chunk in response.iter_content(chunk_size=1024 * 512):
-            if chunk:
-                handle.write(chunk)
-    response.close()
-    return temp_path
+    A missing binary raises FileNotFoundError rather than returning non-zero, so
+    it is translated into a message that names the tool.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=False, text=True).returncode
+    except FileNotFoundError as exc:
+        raise ToolNotFound(f"{cmd[0]} not found. Install it or set its location in settings.") from exc
 
 
-def _download_quatvn_stream_asset(
+def _run_ffmpeg_captured(cmd: list[str]) -> tuple[int, str]:
+    """Run FFmpeg, keeping the tail of stderr so a failure can be explained."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise ToolNotFound(f"{cmd[0]} not found. Install it or set its location in settings.") from exc
+
+    stderr = proc.stderr or ""
+    if stderr:
+        print(stderr, end="" if stderr.endswith("\n") else "\n")
+    tail = "\n".join(stderr.strip().splitlines()[-FFMPEG_STDERR_TAIL_LINES:])
+    return proc.returncode, tail
+
+
+def _preferred_base(
+    metadata_source: CaptureResult,
+    metadata: PageMetadata,
     capture: CaptureResult,
     candidate: StreamCandidate,
-    out_file: Path,
-) -> Path:
-    temp_in = _download_to_temp_file(capture, candidate, ".webp")
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+) -> str | None:
+    page_id = _extract_page_id(metadata_source.final_url or metadata_source.page_url)
+    base = metadata.video_code or None
+    if page_id and metadata.video_code:
+        base = f"{page_id}-{metadata.video_code}"
 
+    plugin = _site_plugin_for_kind(candidate.kind)
+    if plugin is not None:
+        try:
+            refined = plugin.output_base(candidate, metadata_source, base)
+        except Exception:  # noqa: BLE001
+            refined = None
+        if refined:
+            return refined
+    return base
+
+
+def _write_sidecar(capture: CaptureResult, out_file: Path, metadata: PageMetadata) -> None:
+    plugin = _site_plugin_for(capture.final_url or capture.page_url)
+    if plugin is None:
+        return
     try:
-        with tempfile.TemporaryDirectory(prefix="quatvn_frames_", dir="logs") as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            frame_pattern = temp_dir / "frame_%05d.png"
-            concat_path = temp_dir / "frames.txt"
-
-            coalesce_cmd = [
-                "magick",
-                str(temp_in),
-                "-coalesce",
-                str(frame_pattern),
-            ]
-            if _run_ffmpeg(coalesce_cmd) != 0:
-                raise RuntimeError("magick failed to extract quatvn webp frames")
-
-            identify_cmd = [
-                "magick",
-                "identify",
-                "-format",
-                "%T\n",
-                str(temp_in),
-            ]
-            identify = subprocess.run(identify_cmd, capture_output=True, text=True)
-            if identify.returncode != 0:
-                raise RuntimeError("magick failed to read quatvn webp frame delays")
-
-            delays = []
-            for line in (identify.stdout or "").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    delays.append(max(float(line) / 100.0, 0.04))
-                except ValueError:
-                    delays.append(0.04)
-
-            frames = sorted(temp_dir.glob("frame_*.png"))
-            if not frames:
-                raise RuntimeError("no frames extracted from quatvn webp asset")
-
-            lines: list[str] = []
-            for idx, frame in enumerate(frames):
-                lines.append(f"file '{frame.resolve().as_posix()}'")
-                if idx < len(frames) - 1:
-                    duration = delays[idx] if idx < len(delays) else 0.04
-                    lines.append(f"duration {duration:.3f}")
-            lines.append(f"file '{frames[-1].resolve().as_posix()}'")
-            concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-            encode_cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "info",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_path),
-                "-fps_mode",
-                "vfr",
-                "-pix_fmt",
-                "yuv420p",
-                "-an",
-                str(out_file),
-            ]
-            if _run_ffmpeg(encode_cmd) != 0:
-                raise RuntimeError("ffmpeg failed to encode quatvn webp frames")
-    finally:
-        try:
-            temp_in.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    if not out_file.exists() or out_file.stat().st_size == 0:
-        try:
-            out_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise RuntimeError("quatvn conversion produced empty output")
-
-    return out_file
+        plugin.write_sidecar(out_file, metadata)
+    except Exception:  # noqa: BLE001 - a sidecar is never worth failing a download
+        pass
 
 
 def download_with_ffmpeg(
@@ -346,33 +233,36 @@ def download_with_ffmpeg(
 ) -> Path:
     metadata_source = metadata_capture or capture
     metadata = fetch_page_metadata(metadata_source) if write_metadata else PageMetadata()
-    page_id = _extract_page_id(metadata_source.final_url or metadata_source.page_url)
-    preferred_base = metadata.video_code or None
-    if page_id and metadata.video_code:
-        preferred_base = f"{page_id}-{metadata.video_code}"
-    if candidate.kind == "quatvn_webp":
-        base_root = preferred_base or _safe_name(metadata_source.title or "quatvn")
-        preferred_base = f"{base_root}-{_quatvn_asset_suffix(candidate.url)}"
-    out_file = output_file or output_path_for(capture, output_dir, preferred_base=preferred_base)
+    preferred_base = _preferred_base(metadata_source, metadata, capture, candidate)
+
+    out_file = output_file or unique_path(
+        output_path_for(capture, output_dir, preferred_base=preferred_base)
+    )
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    if candidate.kind == "quatvn_webp":
-        out_file = _download_quatvn_stream_asset(capture, candidate, out_file)
-        if write_metadata:
-            _write_description_file(out_file, metadata)
-        return out_file
+
+    postprocessor = _site_plugin_for_kind(candidate.kind)
+    if postprocessor is not None:
+        converted = postprocessor.postprocess(capture, candidate, out_file)
+        if converted is not None:
+            if write_metadata:
+                _write_sidecar(metadata_source, converted, metadata)
+            return converted
 
     cmd = build_ffmpeg_command(capture, candidate, out_file)
+    returncode, stderr_tail = _run_ffmpeg_captured(cmd)
 
-    if _run_ffmpeg(cmd) != 0:
-        if candidate.kind in {"hls", "playlist"} or ".m3u8" in candidate.url.lower() or "manifest" in candidate.url.lower():
+    if returncode != 0:
+        candidate_url = candidate.url.lower()
+        if candidate.kind in {"hls", "playlist"} or ".m3u8" in candidate_url or "manifest" in candidate_url:
             out = download_obfuscated_hls(capture, candidate, out_file)
             if write_metadata:
-                _write_description_file(out, metadata)
+                _write_sidecar(metadata_source, out, metadata)
             return out
-        raise RuntimeError("ffmpeg failed")
+        detail = f": {stderr_tail}" if stderr_tail else ""
+        raise RuntimeError(f"ffmpeg failed with exit code {returncode}{detail}")
 
     if write_metadata:
-        _write_description_file(out_file, metadata)
+        _write_sidecar(metadata_source, out_file, metadata)
     return out_file
 
 
@@ -406,6 +296,10 @@ def _is_mpeg_ts(data: bytes) -> bool:
 
 
 def download_obfuscated_hls(capture: CaptureResult, candidate: StreamCandidate, out_file: Path) -> Path:
+    """Repack an HLS stream whose segments are wrapped behind a PNG header.
+
+    Host-neutral: the technique is detected from the payload, not from a domain.
+    """
     manifest_headers = _request_headers(capture, candidate.referer or capture.final_url)
     response = requests.get(candidate.url, headers=manifest_headers, timeout=30)
     if not response.ok:
@@ -445,9 +339,9 @@ def download_obfuscated_hls(capture: CaptureResult, candidate: StreamCandidate, 
         "copy",
         str(out_file),
     ]
-    remux = subprocess.run(remux_cmd, capture_output=False, text=True)
-    if remux.returncode != 0:
-        raise RuntimeError(f"ffmpeg remux failed with exit code {remux.returncode}")
+    returncode = _run_command(remux_cmd)
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg remux failed with exit code {returncode}")
 
     try:
         ts_path.unlink(missing_ok=True)

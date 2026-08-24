@@ -12,12 +12,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from videotrack.core.download import (
-    _extract_page_id,
-    _quatvn_asset_suffix,
-    _safe_name,
-    output_path_for,
-)
+from videotrack.core.download import _extract_page_id, _safe_name, output_path_for, unique_path
+from videotrack.sites.quatvn import asset_suffix
 from videotrack.core.models import CaptureResult
 
 
@@ -103,13 +99,14 @@ class OutputPathTests(unittest.TestCase):
 
             self.assertTrue(target.is_dir())
 
-    def test_two_items_sharing_a_title_resolve_to_the_same_path(self) -> None:
-        # Documents the collision the plan fixes: identical titles overwrite today.
+    def test_two_items_sharing_a_title_get_distinct_paths_once_written(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            first = output_path_for(_capture(title="Same"), Path(temp_dir))
-            second = output_path_for(_capture(title="Same"), Path(temp_dir))
+            first = unique_path(output_path_for(_capture(title="Same"), Path(temp_dir)))
+            first.write_bytes(b"x")
+            second = unique_path(output_path_for(_capture(title="Same"), Path(temp_dir)))
 
-            self.assertEqual(first, second)
+            self.assertNotEqual(first, second)
+            self.assertEqual(second.name, "Same (2).mp4")
 
 
 class PageIdTests(unittest.TestCase):
@@ -126,15 +123,37 @@ class PageIdTests(unittest.TestCase):
         self.assertIsNone(_extract_page_id("https://page.example.test/"))
 
 
+class UniquePathTests(unittest.TestCase):
+    def test_a_free_path_is_returned_unchanged(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "clip.mp4"
+
+            self.assertEqual(unique_path(target), target)
+
+    def test_an_existing_path_gets_a_numeric_suffix(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "clip.mp4"
+            target.write_bytes(b"x")
+
+            self.assertEqual(unique_path(target).name, "clip (2).mp4")
+
+    def test_suffixes_keep_climbing_past_a_taken_number(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "clip.mp4").write_bytes(b"x")
+            (Path(temp_dir) / "clip (2).mp4").write_bytes(b"x")
+
+            self.assertEqual(unique_path(Path(temp_dir) / "clip.mp4").name, "clip (3).mp4")
+
+
 class QuatvnAssetSuffixTests(unittest.TestCase):
     def test_numbered_webp_becomes_a_zero_padded_clip_suffix(self) -> None:
-        self.assertEqual(_quatvn_asset_suffix("https://cdn.example.test/stream/name%20(7).webp"), "clip-07")
+        self.assertEqual(asset_suffix("https://cdn.example.test/stream/name%20(7).webp"), "clip-07")
 
     def test_two_digit_number_is_preserved(self) -> None:
-        self.assertEqual(_quatvn_asset_suffix("https://cdn.example.test/stream/name%20(12).webp"), "clip-12")
+        self.assertEqual(asset_suffix("https://cdn.example.test/stream/name%20(12).webp"), "clip-12")
 
     def test_unnumbered_asset_falls_back_to_its_stem(self) -> None:
-        self.assertEqual(_quatvn_asset_suffix("https://cdn.example.test/stream/single.webp"), "single")
+        self.assertEqual(asset_suffix("https://cdn.example.test/stream/single.webp"), "single")
 
 
 if __name__ == "__main__":

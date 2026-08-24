@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import re
+import subprocess
+import tempfile
 import time
 from collections import OrderedDict
-import re
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urldefrag, urlparse
 
-from .core.capture import _build_driver, _try_play_in_current_context, selenium_api
-from .core.models import CaptureResult, StreamCandidate
+import requests
+
+from ..core.capture import _build_driver, _try_play_in_current_context, selenium_api
+from ..core.download import _request_headers, _run_command, _safe_name
+from ..core.models import CaptureResult, CrawlPreset, StreamCandidate
+from ..core.paths import ensure_scratch_dir
+from . import BaseSitePlugin, register
 
 
 def is_quatvn_url(url: str) -> bool:
@@ -401,3 +408,186 @@ def discover_quatvn_targets(
             pass
 
     return list(discovered.keys())
+
+
+# --- Stream asset conversion -------------------------------------------------
+#
+# This site serves animated WebP sequences rather than a normal stream, so the
+# frames are extracted with ImageMagick and re-encoded. Core knows nothing about
+# it: the plugin claims the candidate kind and does the work.
+
+
+def asset_suffix(url: str) -> str:
+    """Per-asset filename suffix, so clips of one page do not overwrite."""
+    path = urlparse(url).path or ""
+    name = unquote(path.rsplit("/", 1)[-1])
+    match = re.search(r"\((\d+)\)\.webp$", name, re.IGNORECASE)
+    if match:
+        return f"clip-{int(match.group(1)):02d}"
+    return _safe_name(Path(name).stem or "clip")
+
+
+def _download_to_temp_file(capture: CaptureResult, candidate: StreamCandidate, suffix: str) -> Path:
+    headers = _request_headers(capture, capture.final_url or capture.page_url)
+    response = requests.get(candidate.url, headers=headers, timeout=60, stream=True)
+    if not response.ok:
+        raise RuntimeError(f"asset request failed: HTTP {response.status_code}")
+
+    temp_path = ensure_scratch_dir() / f"quatvn_asset_{abs(hash(candidate.url))}{suffix}"
+    with temp_path.open("wb") as handle:
+        for chunk in response.iter_content(chunk_size=1024 * 512):
+            if chunk:
+                handle.write(chunk)
+    response.close()
+    return temp_path
+
+
+def _frame_delays(temp_in: Path) -> list[float]:
+    identify = subprocess.run(
+        ["magick", "identify", "-format", "%T\n", str(temp_in)],
+        capture_output=True,
+        text=True,
+    )
+    if identify.returncode != 0:
+        raise RuntimeError("magick failed to read quatvn webp frame delays")
+
+    delays: list[float] = []
+    for line in (identify.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            delays.append(max(float(line) / 100.0, 0.04))
+        except ValueError:
+            delays.append(0.04)
+    return delays
+
+
+def _write_concat_file(frames: list[Path], delays: list[float], concat_path: Path) -> None:
+    lines: list[str] = []
+    for index, frame in enumerate(frames):
+        lines.append("file " + repr(frame.resolve().as_posix()))
+        if index < len(frames) - 1:
+            duration = delays[index] if index < len(delays) else 0.04
+            lines.append(f"duration {duration:.3f}")
+    lines.append("file " + repr(frames[-1].resolve().as_posix()))
+    concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def convert_stream_asset(capture: CaptureResult, candidate: StreamCandidate, out_file: Path) -> Path:
+    """Turn one animated WebP asset into a playable MP4."""
+    temp_in = _download_to_temp_file(capture, candidate, ".webp")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="quatvn_frames_", dir=str(ensure_scratch_dir())) as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            frame_pattern = temp_dir / "frame_%05d.png"
+            concat_path = temp_dir / "frames.txt"
+
+            if _run_command(["magick", str(temp_in), "-coalesce", str(frame_pattern)]) != 0:
+                raise RuntimeError("magick failed to extract quatvn webp frames")
+
+            delays = _frame_delays(temp_in)
+            frames = sorted(temp_dir.glob("frame_*.png"))
+            if not frames:
+                raise RuntimeError("no frames extracted from quatvn webp asset")
+
+            _write_concat_file(frames, delays, concat_path)
+
+            encode_cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_path),
+                "-fps_mode",
+                "vfr",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                str(out_file),
+            ]
+            if _run_command(encode_cmd) != 0:
+                raise RuntimeError("ffmpeg failed to encode quatvn webp frames")
+    finally:
+        try:
+            temp_in.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not out_file.exists() or out_file.stat().st_size == 0:
+        try:
+            out_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError("quatvn conversion produced empty output")
+
+    return out_file
+
+
+def _quatvn_crawl_url_filter(url: str, host: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != host or parsed.query:
+        return False
+
+    path = (parsed.path or "/").lower()
+    if path == "/":
+        return False
+
+    reserved = {
+        "category",
+        "danh-muc",
+        "feed",
+        "page",
+        "search",
+        "tag",
+        "wp-admin",
+        "wp-content",
+        "wp-includes",
+        "wp-json",
+    }
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if not segments or any(segment in reserved for segment in segments):
+        return False
+    return "." not in segments[-1]
+
+
+class QuatvnPlugin(BaseSitePlugin):
+    """Site whose media arrives as numbered animated WebP assets."""
+
+    name = "quatvn"
+
+    def handles(self, url: str) -> bool:
+        return is_quatvn_url(url)
+
+    def claims_kind(self, kind: str) -> bool:
+        return kind == "quatvn_webp"
+
+    def output_base(self, candidate: StreamCandidate, capture: CaptureResult, base: str | None) -> str | None:
+        if candidate.kind != "quatvn_webp":
+            return None
+        root = base or _safe_name(capture.title or "quatvn")
+        return f"{root}-{asset_suffix(candidate.url)}"
+
+    def postprocess(self, capture: CaptureResult, candidate: StreamCandidate, out_file: Path) -> Path | None:
+        if candidate.kind != "quatvn_webp":
+            return None
+        return convert_stream_asset(capture, candidate, out_file)
+
+    def crawl_preset(self) -> CrawlPreset:
+        return CrawlPreset(
+            name="quatvn",
+            include_substring="",
+            exclude_substrings=("/author/", "/danh-muc/", "/feed/", "/page/", "/tag/", "/wp-"),
+            url_filter=_quatvn_crawl_url_filter,
+        )
+
+
+register(QuatvnPlugin())

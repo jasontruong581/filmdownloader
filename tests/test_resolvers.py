@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from videotrack import cli
 from videotrack.core.resolvers import Resolution, ResolvedMedia, capture_from_resolution
-from videotrack.static_player import StaticPlayerResolver
+from videotrack.sites.vlxx import StaticPlayerResolver
 
 
 class ResolverContextTests(unittest.TestCase):

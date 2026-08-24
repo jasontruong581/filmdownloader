@@ -3,11 +3,14 @@ from __future__ import annotations
 import html
 import json
 import re
+from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 
-from .core.resolvers import DEFAULT_USER_AGENT, Resolution, ResolvedMedia, media_kind
+from ..core.models import CrawlPreset, PageMetadata
+from ..core.resolvers import DEFAULT_USER_AGENT, Resolution, ResolvedMedia, media_kind
+from . import BaseSitePlugin, register
 
 MEDIA_URL_RE = re.compile(r"https?://[^\"'\s<>]+(?:m3u8|mp4|mpd)[^\"'\s<>]*", re.IGNORECASE)
 
@@ -123,3 +126,121 @@ class StaticPlayerResolver:
             return None
         cookies = {cookie.name: cookie.value for cookie in self.session.cookies}
         return Resolution(self.name, url, page.url, _page_title(page_html), tuple(media), cookies=cookies)
+
+
+# --- Page metadata -----------------------------------------------------------
+#
+# These selectors describe one specific site family's markup. They used to run
+# on every download in core, which named unrelated sites' files from fields that
+# do not exist there.
+
+def _clean_metadata_text(raw: str) -> str:
+    """Strip tags, then unescape, then collapse whitespace.
+
+    Order matters and matches the extractor this moved from: unescaping after
+    tag removal leaves entity-encoded markup as text rather than re-parsing it.
+    """
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _first_match(text: str, pattern: str) -> str | None:
+    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    return _clean_metadata_text(match.group(1)) if match else None
+
+
+def extract_page_metadata(page_html: str) -> PageMetadata:
+    """Pull code, title, cast, and description out of this family's markup."""
+    code = _first_match(
+        page_html,
+        r'<span[^>]*class=["\'][^"\']*video-code[^"\']*["\'][^>]*>(.*?)</span>',
+    )
+    title = (
+        _first_match(page_html, r'<h2[^>]*id=["\']page-title["\'][^>]*>(.*?)</h2>')
+        or _first_match(page_html, r'<h2[^>]*class=["\'][^"\']*\bpage-title\b[^"\']*["\'][^>]*>(.*?)</h2>')
+        or _first_match(page_html, r'<h2[^>]*class=["\'][^"\']*\bbreadcrumb\b[^"\']*["\'][^>]*>(.*?)</h2>')
+    )
+    description = _first_match(
+        page_html,
+        r'<div[^>]*class=["\'][^"\']*video-description[^"\']*["\'][^>]*>(.*?)</div>',
+    )
+
+    actresses: list[str] = []
+    actresses_match = re.search(
+        r'<div[^>]*class=["\'][^"\']*actress-tag[^"\']*["\'][^>]*>(.*?)</div>',
+        page_html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if actresses_match:
+        raw_block = actresses_match.group(1)
+        actresses = [
+            _clean_metadata_text(name)
+            for name in re.findall(r'title=["\']([^"\']+)["\']', raw_block, re.IGNORECASE)
+            if _clean_metadata_text(name)
+        ]
+        if not actresses:
+            plain = _clean_metadata_text(raw_block)
+            actresses = [part.strip() for part in re.split(r"\s{2,}|,\s*", plain) if part.strip()]
+
+    return PageMetadata(
+        video_code=code or None,
+        title=title or None,
+        actresses=actresses or None,
+        description=description or None,
+    )
+
+
+def write_description_sidecar(out_file: Path, metadata: PageMetadata) -> None:
+    sidecar = out_file.with_name(f"{out_file.stem} description.txt")
+    content = (
+        f"title: {metadata.title or ''}\n"
+        f"actress: {', '.join(metadata.actresses or [])}\n"
+        f"Description: {metadata.description or ''}\n"
+    )
+    sidecar.write_text(content, encoding="utf-8")
+
+
+class VlxxPlugin(BaseSitePlugin):
+    """The static-player family that exposes data-movie/data-type markup.
+
+    `handles` is a URL prefilter only. Whether a given page actually carries the
+    expected markup is decided inside the resolver, which returns None when it
+    does not, so the family stays broader than a single hostname.
+    """
+
+    name = "vlxx"
+
+    def handles(self, url: str) -> bool:
+        host = (urlparse(url).hostname or "").lower()
+        return host.startswith("vlxx.") or host == "vlxx" or ".vlxx." in f".{host}."
+
+    def resolver(self):
+        return StaticPlayerResolver()
+
+    def metadata(self, capture, page_html: str | None = None) -> PageMetadata | None:
+        if page_html is not None:
+            return extract_page_metadata(page_html)
+
+        url = capture.final_url or capture.page_url
+        headers = {"User-Agent": capture.user_agent or DEFAULT_USER_AGENT, "Referer": url}
+        if capture.cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in capture.cookies.items())
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+        except requests.RequestException:
+            return PageMetadata()
+        if not response.ok:
+            return PageMetadata()
+        if response.apparent_encoding:
+            response.encoding = response.apparent_encoding
+        return extract_page_metadata(response.text or "")
+
+    def write_sidecar(self, out_file: Path, metadata: PageMetadata) -> None:
+        write_description_sidecar(out_file, metadata)
+
+    def crawl_preset(self) -> CrawlPreset:
+        return CrawlPreset(name="vlxx", include_substring="/video/")
+
+
+register(VlxxPlugin())
