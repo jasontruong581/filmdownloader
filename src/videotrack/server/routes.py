@@ -229,6 +229,7 @@ async def get_batch(batch_id: str, request: Request) -> BatchOut:
         confidence=batch.confidence,
         created_at=batch.created_at,
         jobs=[JobOut(**job.to_dict()) for job in jobs],
+        skipped=[],
     )
 
 

@@ -58,6 +58,22 @@ def host_is_allowed(raw_host: str, settings: Settings) -> bool:
     return True
 
 
+def _supplied_token(request: Request) -> str | None:
+    """Read the token from the Authorization header, or the query string.
+
+    The query string is accepted because EventSource cannot set headers, so an
+    SSE subscription has no other way to authenticate. It is only consulted when
+    a token is configured at all, which means a non-loopback bind.
+    """
+    header = request.headers.get("authorization", "")
+    prefix = "bearer "
+    if header.lower().startswith(prefix):
+        return header[len(prefix) :].strip()
+
+    query_token = request.query_params.get("access_token", "").strip()
+    return query_token or None
+
+
 def make_guard(settings: Settings, configured_token: str | None = None):
     """Build the dependency that guards every /api request."""
     expected = token() if configured_token is None else configured_token
@@ -75,14 +91,13 @@ def make_guard(settings: Settings, configured_token: str | None = None):
         if not expected:
             return
 
-        supplied = request.headers.get("authorization", "")
-        prefix = "bearer "
-        if not supplied.lower().startswith(prefix):
+        supplied = _supplied_token(request)
+        if supplied is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"reason": "token_required", "message": "Provide a bearer token."},
             )
-        if not hmac.compare_digest(supplied[len(prefix) :].strip(), expected):
+        if not hmac.compare_digest(supplied, expected):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"reason": "token_invalid", "message": "Token rejected."},

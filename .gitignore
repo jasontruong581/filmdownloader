@@ -32,3 +32,8 @@ docs/project-plan-video-downloader.docx
 .idea/
 .vscode/
 data/
+
+web/node_modules/
+web/dist/
+web/openapi.json
+src/videotrack/server/static/

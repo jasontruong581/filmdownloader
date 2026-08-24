@@ -54,7 +54,7 @@ class ResolveOut(BaseModel):
     duration: float | None = None
     thumbnail: str | None = None
     uploader: str | None = None
-    formats: list[FormatOut] = Field(default_factory=list)
+    formats: list[FormatOut]
     #: More than one when the URL enumerated several items.
     item_count: int = 1
 
@@ -72,7 +72,7 @@ class BatchProbeOut(BaseModel):
     capability: str
     confidence: str
     batchable: bool
-    items: list[BatchItemOut] = Field(default_factory=list)
+    items: list[BatchItemOut]
     total_estimate: int | None = None
     truncated: bool = False
     #: Rendered verbatim by the UI when nothing enumerated.
@@ -129,8 +129,8 @@ class BatchOut(BaseModel):
     capability: str = ""
     confidence: str = ""
     created_at: str = ""
-    jobs: list[JobOut] = Field(default_factory=list)
-    skipped: list[str] = Field(default_factory=list)
+    jobs: list[JobOut]
+    skipped: list[str]
 
 
 class LibraryItemOut(BaseModel):

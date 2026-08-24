@@ -107,6 +107,23 @@ class RequestGuardTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_a_query_token_is_accepted_because_sse_cannot_set_headers(self) -> None:
+        with _client(Settings(host="127.0.0.1"), token="secret") as client:
+            response = client.get("/api/settings", params={"access_token": "secret"})
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_wrong_query_token_is_rejected(self) -> None:
+        with _client(Settings(host="127.0.0.1"), token="secret") as client:
+            response = client.get("/api/settings", params={"access_token": "nope"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_query_token_is_ignored_when_none_is_configured(self) -> None:
+        # No token configured means loopback-only, where the host guard applies.
+        with _client(Settings(host="127.0.0.1")) as client:
+            self.assertEqual(client.get("/api/settings", params={"access_token": "x"}).status_code, 200)
+
 
 class FrontendMountTests(unittest.TestCase):
     def test_the_api_answers_before_the_frontend_is_built(self) -> None:

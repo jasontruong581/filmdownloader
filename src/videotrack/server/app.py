@@ -78,11 +78,20 @@ def _mount_frontend(app: FastAPI) -> None:
     app.mount("/assets", StaticFiles(directory=directory / "assets"), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False)
-    async def spa(path: str) -> FileResponse:
+    async def spa(path: str):
         """Serve a real file when it exists, otherwise the SPA entry point.
 
-        The fallback is what makes a hard refresh on a client route work.
+        The fallback is what makes a hard refresh on a client route work. It must
+        not swallow the API surface, though: an unknown /api path has to answer
+        with a JSON 404, not with the SPA shell, or a client bug looks like a
+        successful request.
         """
+        if path == "api" or path.startswith("api/"):
+            return JSONResponse(
+                {"reason": "unknown_endpoint", "message": "No such API endpoint."},
+                status_code=404,
+            )
+
         candidate = (directory / path).resolve()
         if path and candidate.is_file() and str(candidate).startswith(str(directory.resolve())):
             return FileResponse(candidate)
