@@ -6,11 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urldefrag, urlparse
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-
-from .capture import _build_driver, _try_play_in_current_context
+from .capture import _build_driver, _try_play_in_current_context, selenium_api
 from .models import CaptureResult, StreamCandidate
 
 
@@ -181,7 +177,7 @@ def _extract_media_like_urls(driver, base_url: str) -> list[str]:
             || node.getAttribute('data-config')
             || node.textContent
             || '';
-          const matches = text.match(/https?:\/\/[^"'\\s<>()]+/g) || [];
+          const matches = text.match(/https?:\\/\\/[^"'\\s<>()]+/g) || [];
           for (const item of matches) found.push(item);
         }
 
@@ -236,7 +232,7 @@ def _collect_tab_elements(driver):
             '.elementor-tab-title',
         ]
     )
-    elements = driver.find_elements(By.CSS_SELECTOR, selectors)
+    elements = driver.find_elements(selenium_api().By.CSS_SELECTOR, selectors)
     unique = []
     seen: set[str] = set()
 
@@ -274,7 +270,10 @@ def discover_quatvn_targets(
 
     try:
         driver.get(page_url)
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        api = selenium_api()
+        api.WebDriverWait(driver, 20).until(
+            api.EC.presence_of_element_located((api.By.TAG_NAME, "body"))
+        )
 
         _try_play_in_current_context(driver)
 
