@@ -4,7 +4,7 @@ description: >-
   Make the downloader site-neutral with yt-dlp as the primary resolver, move
   site-specific logic behind a plugin registry, add a persistent job layer, and
   expose a FastAPI + React frontend with capability-gated batch download.
-status: planned
+status: completed
 priority: P1
 branch: feat/universal-engine-and-web-ui
 tags: []
@@ -106,11 +106,11 @@ yt-dlp's hooks actually emit.
 |-------|-------|------|--------|-----------|
 | 1 | 1a | [Characterization tests, moves, plugin registry](./phase-01a-core-and-site-plugins.md) | **Done** | - |
 | 2 | 2 | [yt-dlp engine, executors, batch probe](./phase-02-ytdlp-engine.md) | **Done** | 1a |
-| 3 | 1b | [Pipeline extraction and event injection](./phase-01b-pipeline-extraction.md) | Planned | 1a, 2 |
-| 4 | 3 | [Job store and progress events](./phase-03-job-layer.md) | Planned | 1b, 2 |
-| 5 | 4 | [FastAPI backend](./phase-04-api-server.md) | Planned | 3 |
-| 6 | 5 | [React frontend](./phase-05-web-frontend.md) | Planned | 4 |
-| 7 | 6 | [Tests, docs, packaging](./phase-06-tests-docs-packaging.md) | Planned | all |
+| 3 | 1b | [Pipeline extraction and event injection](./phase-01b-pipeline-extraction.md) | **Done** | 1a, 2 |
+| 4 | 3 | [Job store and progress events](./phase-03-job-layer.md) | **Done** | 1b, 2 |
+| 5 | 4 | [FastAPI backend](./phase-04-api-server.md) | **Done** | 3 |
+| 6 | 5 | [React frontend](./phase-05-web-frontend.md) | **Done** | 4 |
+| 7 | 6 | [Tests, docs, packaging](./phase-06-tests-docs-packaging.md) | **Done** | all |
 
 ## Effort
 
@@ -179,29 +179,29 @@ Each verified against the current code and assigned to a phase.
 
 ## Acceptance criteria
 
-- [ ] `python main.py run <url>` still resolves and downloads with the same
+- [x] `python main.py run <url>` still resolves and downloads with the same
       flags it accepts today.
-- [ ] A yt-dlp-supported URL resolves without launching Chrome.
-- [ ] A URL that yt-dlp rejects still falls through to a site plugin and then
+- [x] A yt-dlp-supported URL resolves without launching Chrome.
+- [x] A URL that yt-dlp rejects still falls through to a site plugin and then
       to browser capture.
-- [ ] `core/`, `engines/`, `jobs/`, and `server/` contain no site hostnames and
+- [x] `core/`, `engines/`, `jobs/`, and `server/` contain no site hostnames and
       no site-specific selectors; `import videotrack.sites` succeeds with
       Selenium absent.
-- [ ] The web UI resolves a URL, lists selectable formats, queues a download,
+- [x] The web UI resolves a URL, lists selectable formats, queues a download,
       shows live progress with a working indeterminate state, and cancels.
-- [ ] Batch: pasting multiple URLs always works; a playlist or collection URL
+- [x] Batch: pasting multiple URLs always works; a playlist or collection URL
       enumerates its items and enables the batch control; a bare single-video
       URL leaves it disabled with a stated reason; a crawl-preset host enables
       it only after explicit confirmation.
-- [ ] A yt-dlp split-format download (separate video and audio) reports one
+- [x] A yt-dlp split-format download (separate video and audio) reports one
       monotonic progress track, not two runs to 100 percent.
-- [ ] Jobs survive a server restart with their status intact; an interrupted job
+- [x] Jobs survive a server restart with their status intact; an interrupted job
       is never reported as complete.
-- [ ] Cancelling leaves no partial file in the output directory.
-- [ ] Two queued items with identical titles produce two distinct files.
-- [ ] `python -m unittest discover -s tests` passes with no Chrome, no FFmpeg,
+- [x] Cancelling leaves no partial file in the output directory.
+- [x] Two queued items with identical titles produce two distinct files.
+- [x] `python -m unittest discover -s tests` passes with no Chrome, no FFmpeg,
       no network, and no built frontend bundle.
-- [ ] `README.md` and `docs/architecture.md` describe the resolver chain, the
+- [x] `README.md` and `docs/architecture.md` describe the resolver chain, the
       executor split, the batch tiers, the server, and the frontend build.
 
 ## Advisory review

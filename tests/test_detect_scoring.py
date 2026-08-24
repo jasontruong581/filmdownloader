@@ -177,20 +177,36 @@ class PenaltyAndBonusTests(unittest.TestCase):
 
         self.assertEqual(candidates[0].score, 60)
 
-    def test_shipped_host_bonus_is_applied_when_passed(self) -> None:
+    def test_a_caller_supplied_host_bonus_is_applied(self) -> None:
         candidates = detect_candidates(
-            _capture(_request("https://v1.tiktokcdn.com/a.mp4")),
+            _capture(_request("https://cdn.example.test/a.mp4")),
             probe=False,
-            host_bonuses=DEFAULT_HOST_BONUSES,
+            host_bonuses=((r"cdn\.example\.test$", 18),),
         )
 
         self.assertEqual(candidates[0].score, 98)
 
     def test_no_host_bonus_is_applied_by_default(self) -> None:
         # Core carries no hostnames of its own; bonuses are caller-supplied data.
-        candidates = detect_candidates(_capture(_request("https://v1.tiktokcdn.com/a.mp4")), probe=False)
+        candidates = detect_candidates(_capture(_request("https://cdn.example.test/a.mp4")), probe=False)
 
         self.assertEqual(candidates[0].score, 80)
+
+    def test_a_non_matching_host_gets_no_bonus(self) -> None:
+        candidates = detect_candidates(
+            _capture(_request("https://other.example.test/a.mp4")),
+            probe=False,
+            host_bonuses=((r"cdn\.example\.test$", 18),),
+        )
+
+        self.assertEqual(candidates[0].score, 80)
+
+    def test_the_shipped_defaults_are_a_pattern_and_score_pair(self) -> None:
+        # Asserted as data rather than by fetching a real host.
+        self.assertTrue(DEFAULT_HOST_BONUSES)
+        for pattern, bonus in DEFAULT_HOST_BONUSES:
+            self.assertIsInstance(pattern, str)
+            self.assertGreater(bonus, 0)
 
     def test_host_is_derived_from_the_url(self) -> None:
         candidates = detect_candidates(_capture(_request("https://CDN.Example.Test/a.mp4")), probe=False)

@@ -39,13 +39,14 @@ MODULES_THAT_MUST_IMPORT = [
     "videotrack.sites.vlxx",
     "videotrack.sites.flowplayer",
     "videotrack.crawl",
-    # Deprecated re-export paths must stay import-safe while they exist.
-    "videotrack.capture",
-    "videotrack.detect",
-    "videotrack.download",
-    "videotrack.io",
-    "videotrack.models",
-    "videotrack.resolvers",
+    "videotrack.console",
+    "videotrack.engines",
+    "videotrack.engines.chain",
+    "videotrack.engines.batch",
+    "videotrack.engines.ytdlp_resolver",
+    "videotrack.jobs",
+    "videotrack.jobs.store",
+    "videotrack.jobs.manager",
 ]
 
 

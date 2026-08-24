@@ -218,15 +218,23 @@ def crawl_preset_named(name: str) -> CrawlPreset | None:
     return None
 
 
-def _load_builtin_plugins() -> None:
+def _load_builtin_plugins() -> tuple:
     """Import the bundled plugins so importing this package registers them.
 
-    Kept at the bottom so the registry API above is fully defined first: the
-    plugin modules import `register` from here.
+    Each module calls register() at import time, so the order of these import
+    statements is the registration order, and that decides which crawl preset
+    names the command line offers first. It is visible behavior, not style, so
+    the imports are written one per line in the intended order rather than
+    collapsed alphabetically.
+
+    Kept at the bottom of the module so the registry API above is fully defined
+    first: the plugin modules import register() from here.
     """
-    # Import order is registration order, which is also the order presets are
-    # offered on the command line.
-    from . import vlxx, quatvn, flowplayer  # noqa: F401
+    from . import vlxx
+    from . import quatvn
+    from . import flowplayer
+
+    return (vlxx, quatvn, flowplayer)
 
 
 _load_builtin_plugins()
