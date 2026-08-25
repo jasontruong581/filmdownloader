@@ -34,7 +34,7 @@ from ..core.events import (
 )
 from ..core.executor import DownloadCancelled, DownloadRequest
 from ..core.options import PipelineOptions
-from ..core.resolvers import Resolution, capture_from_resolution
+from ..core.resolvers import Resolution, auth_wall_reason, capture_from_resolution
 from .bus import EventBus
 from .cache import ResolutionCache
 from .models import Batch, Job, JobStatus
@@ -305,6 +305,12 @@ class JobManager:
             resolution = resolutions[0]
             job.engine = resolution.engine
             job.title = job.title or resolution.title
+
+        wall = auth_wall_reason(job.url, resolution)
+        if wall is not None:
+            # Otherwise this surfaces as the misleading "no engine resolved this
+            # URL", which reads as a broken extractor rather than a sign-in page.
+            raise RuntimeError(f"this page requires signing in: {wall}")
 
         if job.output_path:
             out_file = Path(job.output_path)

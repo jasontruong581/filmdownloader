@@ -666,6 +666,25 @@ class DiscoveryDelegationTests(_ManagerFixture):
         self.assertEqual(record.status, JobStatus.COMPLETED, record.error)
         self.assertEqual([url for url, _hint in calls], [first, second])
 
+    def test_a_sign_in_wall_is_reported_as_one(self) -> None:
+        # Otherwise this surfaced as "no engine resolved this URL", which reads
+        # as a broken extractor rather than a page asking for an account.
+        manager = self.discovering_manager()
+        wall = Resolution(
+            resolver="browser",
+            page_url="https://page.example.test/watch/3",
+            final_url="https://page.example.test/auth/login?currentUrl=%2Fwatch%2F3",
+            title="Sign in",
+            media=(),
+            engine="browser",
+        )
+
+        with patch("videotrack.engines.chain.resolve", return_value=[wall]):
+            job = manager.submit("https://page.example.test/watch/3")
+            self.wait_for_status(job.id, JobStatus.FAILED)
+
+        self.assertIn("requires signing in", self.store.get(job.id).error)
+
     def test_a_resolution_carrying_nothing_reports_that_plainly(self) -> None:
         manager = self.discovering_manager()
         empty = CaptureResult(

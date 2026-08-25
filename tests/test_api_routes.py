@@ -148,6 +148,64 @@ class ResolveTests(_ApiFixture):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["detail"]["reason"], "not_resolved")
 
+    def test_a_sign_in_wall_is_a_structured_refusal(self) -> None:
+        # Regression: this answered 200, and the UI then queued a job whose URL
+        # was the login page.
+        wall = Resolution(
+            resolver="browser",
+            page_url="https://page.example.test/w/1",
+            final_url="https://page.example.test/auth/login?currentUrl=%2Fw%2F1",
+            title="Sign in",
+            media=(),
+            engine="browser",
+        )
+
+        with patch("videotrack.server.routes.chain_resolve", return_value=[wall]):
+            response = self.client.post("/api/resolve", json={"url": "https://page.example.test/w/1"})
+
+        self.assertEqual(response.status_code, 422)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["reason"], "login_required")
+        self.assertIn("cookies_from_browser", detail["message"])
+
+    def test_a_page_whose_media_lives_in_an_embed_still_resolves(self) -> None:
+        # The guard for the refusal above: no direct media is the normal shape
+        # for an embed-hosted page, and it must still resolve.
+        embedded = Resolution(
+            resolver="browser",
+            page_url="https://page.example.test/w/1",
+            final_url="https://page.example.test/w/1",
+            title="Embedded Clip",
+            media=(),
+            engine="browser",
+        )
+
+        with patch("videotrack.server.routes.chain_resolve", return_value=[embedded]):
+            response = self.client.post("/api/resolve", json={"url": "https://page.example.test/w/1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["title"], "Embedded Clip")
+
+    def test_the_requested_url_is_returned_alongside_the_final_one(self) -> None:
+        # What the client should record for the job, so a redirect target is not
+        # mistaken for the thing that was asked for.
+        redirected = Resolution(
+            resolver="browser",
+            page_url="https://page.example.test/w/1",
+            final_url="https://cdn.example.test/canonical/1",
+            title="Example Clip",
+            media=(),
+            engine="browser",
+        )
+
+        with patch("videotrack.server.routes.chain_resolve", return_value=[redirected]):
+            body = self.client.post(
+                "/api/resolve", json={"url": "https://page.example.test/w/1"}
+            ).json()
+
+        self.assertEqual(body["url"], "https://page.example.test/w/1")
+        self.assertEqual(body["final_url"], "https://cdn.example.test/canonical/1")
+
     def test_an_enumerating_url_reports_its_item_count(self) -> None:
         with patch(
             "videotrack.server.routes.chain_resolve",

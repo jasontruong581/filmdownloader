@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from ..core.models import BatchItem
 from ..core.preflight import check_tools
+from ..core.resolvers import auth_wall_reason
 from ..engines import ytdlp_version
 from ..engines.batch import probe as batch_probe
 from ..engines.batch import sample_verify
@@ -138,6 +139,16 @@ async def resolve(payload: ResolveIn, request: Request) -> ResolveOut:
         )
 
     resolution = resolutions[0]
+    wall = auth_wall_reason(payload.url, resolution)
+    if wall is not None:
+        raise _fail(
+            HTTP_422_UNPROCESSABLE_CONTENT,
+            "login_required",
+            f"This page requires signing in: {wall}. Nothing here bypasses a login. "
+            "If you hold an account, set cookies_from_browser in Settings to reuse "
+            "the session you are already signed in with.",
+        )
+
     resolution_id = state.cache.put(resolution)
     return ResolveOut(
         resolution_id=resolution_id,
