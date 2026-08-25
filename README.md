@@ -162,7 +162,10 @@ downloading; `--overwrite` re-downloads a file whose size already matches.
 
 ## Configuration
 
-Copy `.env.example` and adjust. Every value is optional.
+Copy `.env.example` to `.env` and adjust. Every value is optional. The file is
+read by `main.py` and `python -m videotrack.server` at startup; a variable
+already set in the environment wins over the file, so a shell override stays
+authoritative.
 
 | Variable | Purpose |
 |---|---|

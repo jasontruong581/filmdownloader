@@ -3,9 +3,10 @@
 Threads rather than asyncio: the work is blocking subprocess and requests code,
 and a server bridges with `run_in_threadpool`.
 
-Concurrency is gated by a semaphore rather than the pool size, because a
+Concurrency is gated by an admission count rather than the pool size, because a
 `ThreadPoolExecutor` cannot shrink and the setting has to apply without a
-restart.
+restart. Changing the limit never waits for a running job: it only changes what
+the next worker is admitted against.
 
 Cancellation honesty, stated once here because it reaches the UI: a browser
 capture has no interruption hook. Cancel takes effect between pipeline stages and
@@ -62,10 +63,15 @@ class JobManager:
     def __post_init__(self) -> None:
         self.cache = self.cache or ResolutionCache()
         self.options = self.options or PipelineOptions()
-        self._semaphore = threading.BoundedSemaphore(MAX_POOL_WORKERS)
-        self._permits = MAX_POOL_WORKERS
         self._cancels: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        #: Admission gate. Shares the manager lock so a slot change and a
+        #: cancellation cannot observe half-updated state.
+        self._gate = threading.Condition(self._lock)
+        self._running = 0
+        #: Serializes claim-then-record. Kept apart from the manager lock so a
+        #: submit never contends with admission or cancellation.
+        self._claim_lock = threading.Lock()
         self._pool = ThreadPoolExecutor(max_workers=MAX_POOL_WORKERS, thread_name_prefix="job")
         self._closed = False
         self.set_concurrency(self.concurrency)
@@ -75,18 +81,30 @@ class JobManager:
     def set_concurrency(self, value: int) -> None:
         """Change how many jobs run at once, effective immediately.
 
-        Implemented by holding back permits on a fixed-size pool, since a
-        ThreadPoolExecutor cannot be resized after construction.
+        Never waits for a job. Lowering the limit lets whatever is in flight
+        finish and simply stops admitting replacements; raising it wakes the
+        waiters. Waiting here previously deadlocked outright: this held the
+        manager lock while a worker needed that same lock to release its slot.
         """
         target = max(1, min(int(value), MAX_POOL_WORKERS))
-        with self._lock:
-            while self._permits > target:
-                self._semaphore.acquire()
-                self._permits -= 1
-            while self._permits < target:
-                self._semaphore.release()
-                self._permits += 1
+        with self._gate:
             self.concurrency = target
+            self._gate.notify_all()
+
+    def _admit(self) -> bool:
+        """Claim a slot, waiting for one. False if the manager shut down first."""
+        with self._gate:
+            while not self._closed and self._running >= self.concurrency:
+                self._gate.wait()
+            if self._closed:
+                return False
+            self._running += 1
+            return True
+
+    def _release_slot(self) -> None:
+        with self._gate:
+            self._running -= 1
+            self._gate.notify_all()
 
     # --- submission ----------------------------------------------------------
 
@@ -113,10 +131,12 @@ class JobManager:
             engine=engine,
             batch_id=batch_id,
         )
-        # The output path is claimed before a worker starts, so two concurrent
-        # jobs cannot resolve the same name and race on the same file.
-        job.output_path = str(self._claim_output_path(job, output_dir))
-        self.store.add(job)
+        # Claiming and recording are one step. Two concurrent submits would
+        # otherwise both read the same free name before either was stored, and
+        # under `ffmpeg -y` the two workers would write one file.
+        with self._claim_lock:
+            job.output_path = str(self._claim_output_path(job, output_dir))
+            self.store.add(job)
         self._publish(job, PipelineEvent("job_queued", {"status": job.status.value}))
         self._pool.submit(self._run_job, job.id)
         return job
@@ -166,7 +186,10 @@ class JobManager:
             cookies={},
             requests=[],
         )
-        return unique_path(output_path_for(placeholder, target_dir))
+        return unique_path(
+            output_path_for(placeholder, target_dir),
+            taken=self.store.claimed_output_paths(),
+        )
 
     # --- control -------------------------------------------------------------
 
@@ -208,16 +231,20 @@ class JobManager:
         if self._closed:
             return
         self._closed = True
-        with self._lock:
+        with self._gate:
             for event in self._cancels.values():
                 event.set()
+            # Waiters must stop waiting, or the pool never drains.
+            self._gate.notify_all()
         self._pool.shutdown(wait=wait)
         self.bus.close()
 
     # --- execution -----------------------------------------------------------
 
     def _run_job(self, job_id: str) -> None:
-        with self._semaphore:
+        if not self._admit():
+            return
+        try:
             job = self.store.get(job_id)
             if job is None or job.status in {JobStatus.CANCELLED, JobStatus.COMPLETED}:
                 return
@@ -235,6 +262,8 @@ class JobManager:
             finally:
                 with self._lock:
                     self._cancels.pop(job_id, None)
+        finally:
+            self._release_slot()
 
     def _execute(self, job: Job, cancel: threading.Event) -> None:
         job.status = JobStatus.RESOLVING
@@ -276,7 +305,11 @@ class JobManager:
             job.engine = resolution.engine
             job.title = job.title or resolution.title
 
-        out_file = Path(job.output_path) if job.output_path else self._claim_output_path(job, None)
+        if job.output_path:
+            out_file = Path(job.output_path)
+        else:
+            with self._claim_lock:
+                out_file = self._claim_output_path(job, None)
         request = DownloadRequest(
             out_file=out_file,
             page_url=resolution.final_url or job.url,

@@ -9,6 +9,7 @@ import webbrowser
 
 from .app import create_app, openapi_json
 from .security import InsecureConfiguration
+from ..core.env import load_env_file
 from .settings import load_settings
 
 
@@ -27,6 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before anything reads a setting or a path, so the documented `.env` file
+    # actually reaches them. Real environment variables still win.
+    load_env_file()
     args = build_parser().parse_args(argv)
 
     if args.dump_openapi:

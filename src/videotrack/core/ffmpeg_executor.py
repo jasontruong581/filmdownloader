@@ -28,6 +28,7 @@ from .events import (
 )
 from .executor import DownloadCancelled, DownloadRequest
 from .ffmpeg_progress import FfmpegProgressParser
+from .preflight import resolve_tool
 
 STDERR_TAIL_LINES = 12
 
@@ -46,9 +47,20 @@ def _with_progress_flags(cmd: list[str]) -> list[str]:
 
 
 def _resolved_binary(cmd: list[str], ffmpeg_location: str | None) -> list[str]:
+    """Point argv[0] at the configured FFmpeg.
+
+    The setting names a directory or the executable itself, the same two forms
+    `preflight.resolve_tool` accepts, because that is what the environment
+    variable and the Settings field are documented to take. Substituting the
+    value verbatim turned a directory into an unrunnable argv[0].
+
+    An unusable location leaves the command alone so the existing missing-tool
+    error still surfaces rather than being masked by a path that cannot run.
+    """
     if not ffmpeg_location or not cmd:
         return cmd
-    return [ffmpeg_location, *cmd[1:]]
+    resolved = resolve_tool(cmd[0], Path(ffmpeg_location))
+    return [resolved or cmd[0], *cmd[1:]]
 
 
 class FfmpegExecutor:

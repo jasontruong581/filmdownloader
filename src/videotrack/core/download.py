@@ -8,8 +8,10 @@ site.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -75,18 +77,31 @@ def fetch_page_metadata(capture: CaptureResult, page_html: str | None = None) ->
         return PageMetadata()
 
 
-def unique_path(path: Path) -> Path:
+def path_key(path: Path | str) -> str:
+    """Comparison key for a path: absolute, and case-folded where the OS is."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def unique_path(path: Path, taken: Iterable[str] = ()) -> Path:
     """Return `path`, or the first free `name (n).ext` beside it.
 
     Two pages can easily derive the same name. FFmpeg runs with `-y`, so without
-    this the second download silently overwrites the first, and with concurrent
-    jobs both could write the same file at once.
+    this the second download silently overwrites the first.
+
+    `taken` names paths that are reserved but not written yet. Existence alone is
+    not enough for that case: a queued job has no file on disk, so checking the
+    filesystem hands one name to every job that derives it.
     """
-    if not path.exists():
+    reserved = {path_key(item) for item in taken}
+
+    def free(candidate: Path) -> bool:
+        return not candidate.exists() and path_key(candidate) not in reserved
+
+    if free(path):
         return path
     for counter in range(2, 1000):
         candidate = path.with_name(f"{path.stem} ({counter}){path.suffix}")
-        if not candidate.exists():
+        if free(candidate):
             return candidate
     raise RuntimeError(f"could not find a free filename beside {path}")
 

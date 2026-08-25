@@ -8,6 +8,8 @@ Two properties get particular attention:
 
 from __future__ import annotations
 
+import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -58,9 +60,13 @@ class _ApiFixture(unittest.TestCase):
         runner_patch.start()
         self.addCleanup(runner_patch.stop)
 
+        # The settings endpoint persists, so the destination is redirected for
+        # the same reason the database is: a test run must not rewrite the
+        # operator's real configuration file.
+        self.settings_file = Path(self._temp.name) / "settings.json"
         self.settings = Settings(host="127.0.0.1", output_dir=str(self.output_dir))
         self.client = TestClient(
-            create_app(self.settings, db_path=":memory:"),
+            create_app(self.settings, db_path=":memory:", settings_path=self.settings_file),
             base_url="http://127.0.0.1:8756",
         )
         self.client.__enter__()
@@ -94,6 +100,29 @@ class HealthTests(_ApiFixture):
         body = self.client.get("/api/health").json()
 
         self.assertIsNotNone(body["free_bytes"])
+
+
+    def test_health_honors_the_configured_ffmpeg_location(self) -> None:
+        # Regression: health read the environment variable directly, so the
+        # Settings field the README points operators at changed nothing.
+        configured = Path(self._temp.name) / "ffmpeg-bin"
+        configured.mkdir()
+        self.settings.ffmpeg_location = str(configured)
+
+        with patch("videotrack.server.routes.check_tools") as check:
+            check.return_value = ()
+            self.client.get("/api/health")
+
+        self.assertEqual(check.call_args.args[0], configured)
+
+    def test_health_falls_back_to_discovery_when_no_location_is_set(self) -> None:
+        self.settings.ffmpeg_location = ""
+
+        with patch("videotrack.server.routes.check_tools") as check:
+            check.return_value = ()
+            self.client.get("/api/health")
+
+        self.assertIsNone(check.call_args.args[0])
 
 
 class ResolveTests(_ApiFixture):
@@ -358,6 +387,28 @@ class SettingsTests(_ApiFixture):
         self.client.put("/api/settings", json={"host": "0.0.0.0"})
 
         self.assertEqual(self.client.get("/api/settings").json()["host"], "127.0.0.1")
+
+    def test_a_change_is_written_to_the_configured_destination(self) -> None:
+        self.client.put("/api/settings", json={"concurrency": 3})
+
+        self.assertTrue(self.settings_file.exists())
+        self.assertEqual(json.loads(self.settings_file.read_text())["concurrency"], 3)
+
+    def test_the_state_directory_is_left_alone(self) -> None:
+        # Regression: every run of this suite rewrote the real settings file with
+        # the test's temporary output directory, so an operator was left pointing
+        # at a path that no longer existed.
+        #
+        # The state directory is redirected rather than compared in place: reading
+        # the developer's own file would make this pass or fail on whatever else
+        # happens to be running, such as a server the operator left open.
+        state = Path(self._temp.name) / "state"
+        state.mkdir()
+
+        with patch.dict(os.environ, {"FILMDOWNLOADER_STATE": str(state)}):
+            self.client.put("/api/settings", json={"concurrency": 3})
+
+            self.assertEqual(list(state.iterdir()), [])
 
 
 if __name__ == "__main__":

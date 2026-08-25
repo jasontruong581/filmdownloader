@@ -16,7 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 
 from ..core.models import BatchItem
-from ..core.preflight import check_tools, ffmpeg_location
+from ..core.preflight import check_tools
 from ..engines import ytdlp_version
 from ..engines.batch import probe as batch_probe
 from ..engines.batch import sample_verify
@@ -75,7 +75,7 @@ def _fail(code: int, reason: str, message: str) -> HTTPException:
 @router.get("/health", response_model=HealthOut)
 async def health(request: Request) -> HealthOut:
     state = _state(request)
-    statuses = await run_in_threadpool(check_tools, ffmpeg_location())
+    statuses = await run_in_threadpool(check_tools, state.settings.resolved_ffmpeg_location)
     tools = [
         ToolStatusOut(
             name=item.name,

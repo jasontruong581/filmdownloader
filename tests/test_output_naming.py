@@ -158,3 +158,42 @@ class QuatvnAssetSuffixTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaimedPathTests(unittest.TestCase):
+    """Reserved-but-unwritten names.
+
+    A queued job has no file on disk, so an existence check alone hands one name
+    to every job that derives it.
+    """
+
+    def test_a_claimed_name_is_skipped_even_with_nothing_on_disk(self) -> None:
+        with TemporaryDirectory() as temp:
+            target = Path(temp) / "Clip.mp4"
+
+            result = unique_path(target, taken=[str(target)])
+
+            self.assertEqual(result.name, "Clip (2).mp4")
+
+    def test_claims_and_existing_files_are_both_avoided(self) -> None:
+        with TemporaryDirectory() as temp:
+            target = Path(temp) / "Clip.mp4"
+            target.write_bytes(b"x")
+
+            result = unique_path(target, taken=[str(Path(temp) / "Clip (2).mp4")])
+
+            self.assertEqual(result.name, "Clip (3).mp4")
+
+    def test_a_claim_matches_a_differently_spelled_path(self) -> None:
+        with TemporaryDirectory() as temp:
+            target = Path(temp) / "Clip.mp4"
+
+            result = unique_path(target, taken=[str(Path(temp) / "." / "Clip.mp4")])
+
+            self.assertEqual(result.name, "Clip (2).mp4")
+
+    def test_no_claims_keeps_the_derived_name(self) -> None:
+        with TemporaryDirectory() as temp:
+            target = Path(temp) / "Clip.mp4"
+
+            self.assertEqual(unique_path(target), target)
