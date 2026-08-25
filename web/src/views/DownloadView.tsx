@@ -48,7 +48,9 @@ export function DownloadView({ onQueued }: Props) {
     try {
       await api.queueJob({
         resolution_id: resolved.resolution_id,
-        url: resolved.final_url || url.trim(),
+        // The URL that was asked for, not where the page ended up. A redirect
+        // target is the wrong thing to record and the wrong thing to retry.
+        url: resolved.url || url.trim(),
         format_id: formatId || undefined,
         title: resolved.title,
       });

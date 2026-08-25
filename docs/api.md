@@ -21,6 +21,7 @@ zero: a bar pinned at zero reads as a stalled download.
 | Reason | Status | Meaning |
 |---|---|---|
 | `not_resolved` | 422 | No engine recognized media on the page |
+| `login_required` | 422 | The page redirected to a sign-in page and carried no media |
 | `resolve_busy` | 429 | Resolve concurrency saturated; retry shortly |
 | `no_url` | 400 | Neither a url nor a usable resolution_id was given |
 | `resolution_expired` | 410 | The cached resolution aged out; resolve again |
@@ -56,6 +57,18 @@ again: for a browser-resolved page that saves a second full Chrome session.
 
 `item_count` above 1 means the URL enumerated several items; use the batch
 endpoints to queue them all.
+
+`url` is what was asked for; `final_url` is where the page ended up. **Queue the
+former.** A redirect target is the wrong thing to record on a job and the wrong
+thing to re-resolve on retry.
+
+A page that redirects to a sign-in route and carries no media answers
+`login_required` rather than reporting success. Three conditions have to hold at
+once - a redirect happened, the destination has an auth path segment, and no
+media was found - because a resolution with no media is the ordinary shape for a
+page serving its stream from an embed, and refusing on that alone would break
+every embed-hosted page. Nothing gets past the wall; an operator who holds an
+account can set `cookies_from_browser` to reuse the session they already have.
 
 ## Batch
 
