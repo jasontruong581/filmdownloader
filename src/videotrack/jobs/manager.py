@@ -19,12 +19,14 @@ from __future__ import annotations
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
 from ..core.download import output_path_for, unique_path
 from ..core.events import (
+    CANDIDATE_ATTEMPT,
+    CANDIDATE_REJECTED,
     DOWNLOAD_COMPLETED,
     FAILED,
     PROGRESS,
@@ -293,7 +295,6 @@ class JobManager:
         cancel: threading.Event,
         on_event: Callable[[PipelineEvent], None],
     ) -> Path:
-        from ..core.ffmpeg_executor import FfmpegExecutor
         from ..engines.chain import ChainOptions, resolve as chain_resolve
         from ..engines.ytdlp_executor import YtDlpExecutor
 
@@ -320,17 +321,105 @@ class JobManager:
         if resolution.engine == "ytdlp":
             return YtDlpExecutor().run(request, cancel, on_event)
 
+        return self._download_detected(resolution, request, cancel, on_event)
+
+    def _download_detected(
+        self,
+        resolution: Resolution,
+        request: DownloadRequest,
+        cancel: threading.Event,
+        on_event: Callable[[PipelineEvent], None],
+    ) -> Path:
+        """Download media the browser or a site plugin found.
+
+        Discovery is delegated to `core.pipeline`, which is the path the CLI
+        takes. A bare `detect_candidates` call is not enough: a page that serves
+        its stream from an embed yields nothing on the outer capture, and only
+        the pipeline's deep scan reaches the embed. The pipeline also re-captures
+        that embed for the download, since the embed's own session is what its
+        CDN authorizes, and its ranking probes the winner's duration, which is
+        what lets progress report a percent instead of staying indeterminate.
+
+        Only the transfer stays here, on the executor: that is what carries
+        cancellation and the progress events.
+        """
+        from ..core.ffmpeg_executor import FfmpegExecutor
+        from ..core.pipeline import (
+            prepare_candidates,
+            probe_duration_seconds,
+            resolve_download_capture,
+        )
+
         capture = capture_from_resolution(resolution)
         if not capture.requests:
             raise RuntimeError("the resolution carries no media to download")
-        from ..core.detect import detect_candidates
 
-        candidates = detect_candidates(capture, probe=False, host_bonuses=self.options.host_bonuses)
-        if not candidates:
+        selected, _stage_counts, _all_candidates = prepare_candidates(capture, self.options, on_event)
+        if not selected:
             raise RuntimeError("no candidate could be detected for this resolution")
-        request.capture = capture
-        request.candidate = candidates[0]
-        return FfmpegExecutor().run(request, cancel, on_event)
+        if cancel.is_set():
+            raise DownloadCancelled("cancelled before downloading")
+
+        download_capture = resolve_download_capture(capture, selected, self.options, on_event)
+
+        attempts = min(self.options.max_attempts, len(selected))
+        last_error: Exception | None = None
+        for index, candidate in enumerate(selected[:attempts], start=1):
+            if cancel.is_set():
+                raise DownloadCancelled("cancelled between candidates")
+            on_event(
+                PipelineEvent(
+                    CANDIDATE_ATTEMPT,
+                    {
+                        "index": index,
+                        "total": attempts,
+                        "kind": candidate.kind,
+                        "url": candidate.url,
+                    },
+                )
+            )
+            attempt = replace(request, capture=download_capture, candidate=candidate)
+            try:
+                out_file = FfmpegExecutor(duration_hint=candidate.probe_duration).run(
+                    attempt, cancel, on_event
+                )
+            except DownloadCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                on_event(
+                    PipelineEvent(
+                        CANDIDATE_REJECTED,
+                        {"url": candidate.url, "reason": "error", "error": str(exc)},
+                    )
+                )
+                continue
+
+            duration = probe_duration_seconds(out_file)
+            if duration is not None and duration < float(self.options.min_duration):
+                # Usually an advert or a preview rather than the feature.
+                on_event(
+                    PipelineEvent(
+                        CANDIDATE_REJECTED,
+                        {
+                            "url": candidate.url,
+                            "reason": "too_short",
+                            "duration": duration,
+                            "minimum": self.options.min_duration,
+                        },
+                    )
+                )
+                try:
+                    out_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+
+            return out_file
+
+        if last_error is not None:
+            raise RuntimeError(f"every candidate failed to download: {last_error}")
+        raise RuntimeError("every candidate was rejected as too short")
 
     # --- event plumbing ------------------------------------------------------
 
