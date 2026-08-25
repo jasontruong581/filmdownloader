@@ -15,10 +15,17 @@ import subprocess
 import threading
 from pathlib import Path
 
-from .download import ToolNotFound, build_ffmpeg_command
+from .download import (
+    ToolNotFound,
+    build_ffmpeg_command,
+    download_obfuscated_hls,
+    is_hls_candidate,
+    postprocess_candidate,
+)
 from .events import (
     DOWNLOAD_COMPLETED,
     FAILED,
+    INFO,
     PHASE_DOWNLOADING,
     EventSink,
     MonotonicProgress,
@@ -80,6 +87,14 @@ class FfmpegExecutor:
         if request.capture is None or request.candidate is None:
             raise ValueError("the ffmpeg executor needs a capture and a candidate")
 
+        # A plugin that claims this kind fetches the asset itself. An animated
+        # WebP is the bundled example: FFmpeg cannot download it at all.
+        converted = postprocess_candidate(request.capture, request.candidate, request.out_file)
+        if converted is not None:
+            on_event(progress_event(Progress(phase=PHASE_DOWNLOADING, percent=100.0)))
+            on_event(PipelineEvent(DOWNLOAD_COMPLETED, {"path": str(converted)}))
+            return converted
+
         part_file = request.out_file.with_name(f"{request.out_file.stem}.part{request.out_file.suffix}")
         part_file.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -135,6 +150,13 @@ class FfmpegExecutor:
         if returncode != 0:
             _discard(part_file)
             detail = "\n".join(stderr_tail[-STDERR_TAIL_LINES:]).strip()
+            if is_hls_candidate(request.candidate):
+                # FFmpeg refuses plenty of real playlists: segments served with
+                # no usable extension, a MIME type that is not RFC 8216
+                # compliant, or a payload wrapped behind another format's
+                # header. Fetching the segments directly is the only thing that
+                # reads those, so a failure here is not the end of the attempt.
+                return self._repack(request, cancel, on_event, detail)
             on_event(PipelineEvent(FAILED, {"reason": "ffmpeg_failed", "error": detail}))
             raise RuntimeError(
                 f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
@@ -148,6 +170,51 @@ class FfmpegExecutor:
         on_event(progress_event(folder.fold(Progress(phase=PHASE_DOWNLOADING, percent=100.0))))
         on_event(PipelineEvent(DOWNLOAD_COMPLETED, {"path": str(request.out_file)}))
         return request.out_file
+
+
+    def _repack(
+        self,
+        request: DownloadRequest,
+        cancel: threading.Event,
+        on_event: EventSink,
+        ffmpeg_detail: str,
+    ) -> Path:
+        """Fetch the playlist segments directly when FFmpeg would not read them.
+
+        Progress is reported through the callback rather than printed, which is
+        what lets a server use this path, and the segment loop polls the cancel
+        event so a long repack stays interruptible.
+        """
+        assert request.capture is not None and request.candidate is not None
+        on_event(
+            PipelineEvent(
+                INFO,
+                {"message": "FFmpeg refused this playlist; fetching its segments directly."},
+            )
+        )
+
+        def report(done: int, total: int) -> None:
+            percent = (done / total * 100.0) if total else None
+            on_event(progress_event(Progress(phase=PHASE_DOWNLOADING, percent=percent)))
+
+        try:
+            out = download_obfuscated_hls(
+                request.capture,
+                request.candidate,
+                request.out_file,
+                cancel=cancel,
+                on_progress=report,
+            )
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            error = f"ffmpeg refused it ({ffmpeg_detail or 'no detail'}) and the repack failed: {exc}"
+            on_event(PipelineEvent(FAILED, {"reason": "repack_failed", "error": error}))
+            raise RuntimeError(error) from exc
+
+        on_event(progress_event(Progress(phase=PHASE_DOWNLOADING, percent=100.0)))
+        on_event(PipelineEvent(DOWNLOAD_COMPLETED, {"path": str(out)}))
+        return out
 
 
 def _drain_stderr(process: subprocess.Popen, tail: list[str]) -> None:

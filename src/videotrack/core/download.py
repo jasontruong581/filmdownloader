@@ -11,13 +11,17 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections.abc import Iterable
+import threading
+from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
 
+from .executor import DownloadCancelled
 from .models import CaptureResult, PageMetadata, StreamCandidate
+from .preflight import resolve_tool
 
 FFMPEG_STDERR_TAIL_LINES = 12
 
@@ -64,6 +68,58 @@ def _site_plugin_for_kind(kind: str):
     from ..sites import plugin_for_kind
 
     return plugin_for_kind(kind)
+
+
+def postprocess_candidate(
+    capture: CaptureResult, candidate: StreamCandidate, out_file: Path
+) -> Path | None:
+    """Let a site plugin fetch this candidate itself, if one claims its kind.
+
+    Some assets are not something FFmpeg can download at all - an animated WebP
+    is the bundled example - so the plugin produces the file and the caller skips
+    FFmpeg entirely. Public because both download paths need it.
+    """
+    plugin = _site_plugin_for_kind(candidate.kind)
+    if plugin is None:
+        return None
+    return plugin.postprocess(capture, candidate, out_file)
+
+
+def is_hls_candidate(candidate: StreamCandidate) -> bool:
+    """Whether this candidate is a playlist rather than a single file.
+
+    Judged by kind first and URL shape second, because a real playlist is not
+    always named `.m3u8`. Shared so the command builder and the repack fallback
+    cannot disagree about what they are looking at.
+    """
+    url = candidate.url.lower()
+    return candidate.kind in {"hls", "playlist"} or ".m3u8" in url or "manifest" in url
+
+
+@lru_cache(maxsize=1)
+def hls_strictness_flags() -> tuple[str, ...]:
+    """Flags that relax the HLS demuxer, limited to what this FFmpeg accepts.
+
+    FFmpeg 7.1 added `extension_picky`, on by default, which rejects a segment
+    whose extension it does not recognize *and* a playlist whose MIME type is
+    not RFC 8216 compliant - both common on real sites, and neither loosened by
+    `allowed_extensions` alone.
+
+    Probed rather than assumed: passing an option an older build does not have
+    makes it exit before downloading anything.
+    """
+    binary = resolve_tool("ffmpeg") or "ffmpeg"
+    try:
+        result = subprocess.run(
+            [binary, "-hide_banner", "-h", "demuxer=hls"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    help_text = (result.stdout or "") + (result.stderr or "")
+    return ("-extension_picky", "0") if "extension_picky" in help_text else ()
 
 
 def fetch_page_metadata(capture: CaptureResult, page_html: str | None = None) -> PageMetadata:
@@ -153,8 +209,7 @@ def build_ffmpeg_command(
     if headers:
         cmd.extend(["-headers", headers])
 
-    candidate_url = candidate.url.lower()
-    if candidate.kind in {"hls", "playlist"} or ".m3u8" in candidate_url or "manifest" in candidate_url:
+    if is_hls_candidate(candidate):
         cmd.extend(
             [
                 "-protocol_whitelist",
@@ -163,6 +218,7 @@ def build_ffmpeg_command(
                 "ALL",
             ]
         )
+        cmd.extend(hls_strictness_flags())
 
     cmd.extend(
         [
@@ -178,6 +234,14 @@ def build_ffmpeg_command(
 
 class ToolNotFound(RuntimeError):
     """An external binary is not on PATH or at its configured location."""
+
+
+def _discard_partial(path: Path) -> None:
+    """Remove a partial file, tolerating a Windows lock held by a dying process."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _run_command(cmd: list[str]) -> int:
@@ -255,20 +319,17 @@ def download_with_ffmpeg(
     )
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    postprocessor = _site_plugin_for_kind(candidate.kind)
-    if postprocessor is not None:
-        converted = postprocessor.postprocess(capture, candidate, out_file)
-        if converted is not None:
-            if write_metadata:
-                _write_sidecar(metadata_source, converted, metadata)
-            return converted
+    converted = postprocess_candidate(capture, candidate, out_file)
+    if converted is not None:
+        if write_metadata:
+            _write_sidecar(metadata_source, converted, metadata)
+        return converted
 
     cmd = build_ffmpeg_command(capture, candidate, out_file)
     returncode, stderr_tail = _run_ffmpeg_captured(cmd)
 
     if returncode != 0:
-        candidate_url = candidate.url.lower()
-        if candidate.kind in {"hls", "playlist"} or ".m3u8" in candidate_url or "manifest" in candidate_url:
+        if is_hls_candidate(candidate):
             out = download_obfuscated_hls(capture, candidate, out_file)
             if write_metadata:
                 _write_sidecar(metadata_source, out, metadata)
@@ -310,10 +371,23 @@ def _is_mpeg_ts(data: bytes) -> bool:
     return hits >= max(2, checks - 3)
 
 
-def download_obfuscated_hls(capture: CaptureResult, candidate: StreamCandidate, out_file: Path) -> Path:
-    """Repack an HLS stream whose segments are wrapped behind a PNG header.
+def download_obfuscated_hls(
+    capture: CaptureResult,
+    candidate: StreamCandidate,
+    out_file: Path,
+    cancel: threading.Event | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> Path:
+    """Repack an HLS stream FFmpeg cannot read, segment by segment.
 
     Host-neutral: the technique is detected from the payload, not from a domain.
+    Handles segments wrapped behind a PNG header and segments served with no
+    usable extension, neither of which FFmpeg's own HLS demuxer will accept.
+
+    `on_progress` receives (done, total) per segment. A caller that passes it
+    gets no stdout at all, which is what lets a server use this; the CLI passes
+    nothing and keeps printing. `cancel` is polled between segments, the only
+    place this can stop without leaving a torn file.
     """
     manifest_headers = _request_headers(capture, candidate.referer or capture.final_url)
     response = requests.get(candidate.url, headers=manifest_headers, timeout=30)
@@ -329,18 +403,27 @@ def download_obfuscated_hls(capture: CaptureResult, candidate: StreamCandidate, 
     ts_path = out_file.with_suffix(".ts")
     headers = _request_headers(capture, candidate.referer or candidate.url)
 
+    total = len(segment_urls)
     with ts_path.open("wb") as ts:
         for idx, seg_url in enumerate(segment_urls, start=1):
+            if cancel is not None and cancel.is_set():
+                ts.close()
+                _discard_partial(ts_path)
+                raise DownloadCancelled("cancelled while repacking segments")
+
             seg_resp = requests.get(seg_url, headers=headers, timeout=30)
             if not seg_resp.ok:
-                raise RuntimeError(f"segment request failed at {idx}/{len(segment_urls)}: HTTP {seg_resp.status_code}")
+                raise RuntimeError(f"segment request failed at {idx}/{total}: HTTP {seg_resp.status_code}")
 
             payload = _extract_png_tail_payload(seg_resp.content)
             if idx == 1 and not _is_mpeg_ts(payload):
-                raise RuntimeError("segment payload is not MPEG-TS after PNG extraction")
+                raise RuntimeError("segment payload is not usable media after unwrapping")
             ts.write(payload)
-            if idx % 50 == 0 or idx == len(segment_urls):
-                print(f"[i] Repacked segments: {idx}/{len(segment_urls)}")
+
+            if on_progress is not None:
+                on_progress(idx, total)
+            elif idx % 50 == 0 or idx == total:
+                print(f"[i] Repacked segments: {idx}/{total}")
 
     remux_cmd = [
         "ffmpeg",
