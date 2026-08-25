@@ -105,6 +105,37 @@ class CompletionTests(_ManagerFixture):
         blocked.set()
 
 
+    def test_two_jobs_with_the_same_title_claim_distinct_paths(self) -> None:
+        # Regression: the claim consulted only the filesystem, and nothing is
+        # written at submit time, so both jobs saw the same free name. Under
+        # `ffmpeg -y` two workers would then write one file.
+        blocked = threading.Event()
+
+        def runner(job, resolution, cancel, on_event):
+            blocked.wait(timeout=SETTLE_SECONDS)
+            out = Path(job.output_path)
+            out.write_bytes(b"x")
+            return out
+
+        manager = self.build(runner)
+        first = manager.submit("https://page.example.test/w/1", title="Same Title")
+        second = manager.submit("https://page.example.test/w/2", title="Same Title")
+
+        self.assertNotEqual(first.output_path, second.output_path)
+
+        blocked.set()
+        self.assertTrue(
+            self.wait_for(
+                lambda: all(
+                    self.store.get(job.id).status == JobStatus.COMPLETED
+                    for job in (first, second)
+                )
+            )
+        )
+        self.assertTrue(Path(first.output_path).exists())
+        self.assertTrue(Path(second.output_path).exists())
+
+
 class ConcurrencyTests(_ManagerFixture):
     def test_concurrency_never_exceeds_the_limit(self) -> None:
         lock = threading.Lock()
@@ -151,6 +182,66 @@ class ConcurrencyTests(_ManagerFixture):
         manager.set_concurrency(3)
 
         self.assertEqual(manager.concurrency, 3)
+
+
+    def test_lowering_concurrency_while_every_slot_is_held_does_not_block(self) -> None:
+        # Regression: the change waited on a blocking acquire while holding the
+        # manager lock, so `PUT /api/settings` hung until a job finished, and
+        # cancel() and shutdown() hung behind the same lock.
+        release = threading.Event()
+        entered = threading.Semaphore(0)
+
+        def runner(job, resolution, cancel, on_event):
+            entered.release()
+            release.wait(timeout=SETTLE_SECONDS)
+            out = Path(job.output_path)
+            out.write_bytes(b"x")
+            return out
+
+        manager = self.build(runner, concurrency=2)
+        first = manager.submit("https://page.example.test/w/1")
+        manager.submit("https://page.example.test/w/2")
+        self.assertTrue(entered.acquire(timeout=SETTLE_SECONDS))
+        self.assertTrue(entered.acquire(timeout=SETTLE_SECONDS))
+
+        changed = threading.Event()
+
+        def lower() -> None:
+            manager.set_concurrency(1)
+            changed.set()
+
+        threading.Thread(target=lower, daemon=True).start()
+
+        self.assertTrue(changed.wait(timeout=2.0), "set_concurrency blocked while slots were held")
+        self.assertEqual(manager.concurrency, 1)
+        # The lock it used to hold is the one cancel() and shutdown() need.
+        self.assertTrue(manager.cancel(first.id))
+        release.set()
+
+    def test_an_excess_job_is_not_admitted_after_the_limit_drops(self) -> None:
+        running = []
+        release = threading.Event()
+        lock = threading.Lock()
+
+        def runner(job, resolution, cancel, on_event):
+            with lock:
+                running.append(job.id)
+            release.wait(timeout=SETTLE_SECONDS)
+            out = Path(job.output_path)
+            out.write_bytes(b"x")
+            return out
+
+        manager = self.build(runner, concurrency=2)
+        manager.submit("https://page.example.test/w/1")
+        manager.submit("https://page.example.test/w/2")
+        self.assertTrue(self.wait_for(lambda: len(running) == 2))
+
+        manager.set_concurrency(1)
+        manager.submit("https://page.example.test/w/3")
+
+        # The two in flight are allowed to finish, but nothing replaces them.
+        self.assertFalse(self.wait_for(lambda: len(running) > 2, timeout=0.5))
+        release.set()
 
 
 class FailureTests(_ManagerFixture):

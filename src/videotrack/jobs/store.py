@@ -200,6 +200,22 @@ class JobStore:
             row = self._conn.execute(query, params).fetchone()
         return Job.from_row(dict(row)) if row else None
 
+    def claimed_output_paths(self) -> set[str]:
+        """Output paths reserved by jobs that have not written their file yet.
+
+        Active jobs only. A finished job's file is on disk, where an existence
+        check already sees it, and a cancelled job's name is free to reuse.
+        """
+        statuses = sorted(status.value for status in ACTIVE_STATUSES)
+        placeholders = ", ".join("?" for _ in statuses)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT output_path FROM jobs "
+                f"WHERE output_path IS NOT NULL AND status IN ({placeholders})",
+                statuses,
+            ).fetchall()
+        return {row["output_path"] for row in rows if row["output_path"]}
+
     def recover_interrupted(self) -> list[Job]:
         """Mark jobs that were mid-flight when the process died.
 
