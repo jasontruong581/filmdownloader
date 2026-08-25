@@ -24,6 +24,7 @@ from .core.pipeline import (
     resolve_download_capture,
 )
 from .core.pipeline import run as pipeline_run
+from .core.env import load_env_file
 from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
 from .engines import ytdlp_version
 from .engines.batch import probe as batch_probe, sample_verify
@@ -715,6 +716,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before the parser builds its defaults from the paths module, so the
+    # documented `.env` file actually reaches them.
+    load_env_file()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
