@@ -23,6 +23,10 @@ from videotrack.jobs.store import JobStore
 
 SETTLE_SECONDS = 3.0
 POLL_SECONDS = 0.02
+#: Escape hatch for a runner a test holds open. Deliberately far longer than any
+#: window a test measures against, so a slow machine cannot let a runner finish
+#: early and turn a timing assertion into a false failure. It only bounds a hang.
+RUNNER_GUARD_SECONDS = 60.0
 
 
 class _ManagerFixture(unittest.TestCase):
@@ -193,7 +197,7 @@ class ConcurrencyTests(_ManagerFixture):
 
         def runner(job, resolution, cancel, on_event):
             entered.release()
-            release.wait(timeout=SETTLE_SECONDS)
+            release.wait(timeout=RUNNER_GUARD_SECONDS)
             out = Path(job.output_path)
             out.write_bytes(b"x")
             return out
@@ -226,7 +230,7 @@ class ConcurrencyTests(_ManagerFixture):
         def runner(job, resolution, cancel, on_event):
             with lock:
                 running.append(job.id)
-            release.wait(timeout=SETTLE_SECONDS)
+            release.wait(timeout=RUNNER_GUARD_SECONDS)
             out = Path(job.output_path)
             out.write_bytes(b"x")
             return out

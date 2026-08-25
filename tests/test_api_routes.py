@@ -9,6 +9,7 @@ Two properties get particular attention:
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -397,14 +398,17 @@ class SettingsTests(_ApiFixture):
         # Regression: every run of this suite rewrote the real settings file with
         # the test's temporary output directory, so an operator was left pointing
         # at a path that no longer existed.
-        from videotrack.server.settings import settings_path
+        #
+        # The state directory is redirected rather than compared in place: reading
+        # the developer's own file would make this pass or fail on whatever else
+        # happens to be running, such as a server the operator left open.
+        state = Path(self._temp.name) / "state"
+        state.mkdir()
 
-        before = settings_path().read_text() if settings_path().exists() else None
+        with patch.dict(os.environ, {"FILMDOWNLOADER_STATE": str(state)}):
+            self.client.put("/api/settings", json={"concurrency": 3})
 
-        self.client.put("/api/settings", json={"concurrency": 3})
-
-        after = settings_path().read_text() if settings_path().exists() else None
-        self.assertEqual(before, after)
+            self.assertEqual(list(state.iterdir()), [])
 
 
 if __name__ == "__main__":
