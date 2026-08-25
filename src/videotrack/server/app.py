@@ -33,13 +33,14 @@ def create_app(
     settings: Settings | None = None,
     db_path: Path | str | None = None,
     token: str | None = None,
+    settings_path: Path | str | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     verify_configuration(settings, token)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        state = ServerState.build(settings, db_path=db_path)
+        state = ServerState.build(settings, db_path=db_path, settings_path=settings_path)
         # A job left running by a previous process is not complete.
         state.manager.recover_interrupted()
         app.state.server = state

@@ -7,10 +7,13 @@ neutral executor and site-specific postprocessors.
 
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from videotrack.core.download import _headers_block, build_ffmpeg_command
+from videotrack.core.ffmpeg_executor import _resolved_binary
 from videotrack.core.models import CaptureResult, StreamCandidate
 
 OUT = Path("output") / "clip.mp4"
@@ -122,3 +125,46 @@ class HlsFlagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolvedBinaryTests(unittest.TestCase):
+    """How a configured FFmpeg location reaches argv[0].
+
+    The setting names a directory or the executable. `preflight.resolve_tool`
+    has always accepted both; the executor used to substitute the raw value, so
+    a directory - which is what the documented env var and the Settings field
+    both suggest - produced a command that could not run.
+    """
+
+    def _install_fake_ffmpeg(self, directory: Path) -> Path:
+        binary = directory / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        binary.write_text("")
+        binary.chmod(0o755)
+        return binary
+
+    def test_a_directory_resolves_to_the_executable_inside_it(self) -> None:
+        with TemporaryDirectory() as temp:
+            binary = self._install_fake_ffmpeg(Path(temp))
+
+            cmd = _resolved_binary(["ffmpeg", "-i", "in.m3u8"], temp)
+
+            self.assertEqual(Path(cmd[0]), binary)
+            self.assertEqual(cmd[1:], ["-i", "in.m3u8"])
+
+    def test_an_executable_path_is_honored_as_given(self) -> None:
+        with TemporaryDirectory() as temp:
+            binary = self._install_fake_ffmpeg(Path(temp))
+
+            cmd = _resolved_binary(["ffmpeg", "-i", "in.m3u8"], str(binary))
+
+            self.assertEqual(Path(cmd[0]), binary)
+
+    def test_an_unusable_location_leaves_the_command_alone(self) -> None:
+        # The missing-tool error has to stay reachable rather than being masked.
+        with TemporaryDirectory() as temp:
+            cmd = _resolved_binary(["ffmpeg", "-i", "in.m3u8"], str(Path(temp) / "absent"))
+
+            self.assertEqual(cmd[0], "ffmpeg")
+
+    def test_no_location_leaves_the_command_alone(self) -> None:
+        self.assertEqual(_resolved_binary(["ffmpeg", "-y"], None), ["ffmpeg", "-y"])

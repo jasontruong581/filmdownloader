@@ -35,6 +35,8 @@ class ServerState:
     cache: ResolutionCache
     manager: JobManager
     resolve_slots: threading.Semaphore
+    #: Where `apply_settings` writes. None means the state directory.
+    settings_file: Path | None = None
 
     @classmethod
     def build(
@@ -42,6 +44,7 @@ class ServerState:
         settings: Settings,
         db_path: Path | str | None = None,
         resolve_slots: int = DEFAULT_RESOLVE_SLOTS,
+        settings_path: Path | str | None = None,
     ) -> "ServerState":
         store = JobStore(db_path if db_path is not None else state_dir() / "jobs.db")
         bus = EventBus()
@@ -60,6 +63,7 @@ class ServerState:
             cache=cache,
             manager=manager,
             resolve_slots=threading.Semaphore(resolve_slots),
+            settings_file=Path(settings_path) if settings_path is not None else None,
         )
 
     @staticmethod
@@ -78,7 +82,7 @@ class ServerState:
         )
 
     def apply_settings(self, settings: Settings) -> Settings:
-        self.settings = save_settings(settings)
+        self.settings = save_settings(settings, self.settings_file)
         self.manager.options = self.pipeline_options(settings)
         self.manager.set_concurrency(settings.concurrency)
         return self.settings

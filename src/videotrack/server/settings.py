@@ -55,6 +55,17 @@ class Settings:
     def resolved_output_dir(self) -> Path:
         return Path(self.output_dir) if self.output_dir else default_output_dir()
 
+    @property
+    def resolved_ffmpeg_location(self) -> Path | None:
+        """Configured FFmpeg directory or executable, if one was set.
+
+        `load_settings` already folds the environment variable in, so this is the
+        single place that answers the question. Reading the variable directly
+        instead would ignore whatever the operator set in Settings.
+        """
+        raw = self.ffmpeg_location.strip()
+        return Path(raw).expanduser() if raw else None
+
     def to_dict(self) -> dict:
         data = asdict(self)
         data["output_dir"] = str(self.resolved_output_dir)
@@ -104,8 +115,14 @@ def load_settings() -> Settings:
     return settings
 
 
-def save_settings(settings: Settings) -> Settings:
-    path = settings_path()
+def save_settings(settings: Settings, path: Path | str | None = None) -> Settings:
+    """Persist settings, by default to the state directory.
+
+    The destination is a parameter for the same reason the job database path is:
+    a test that exercises the settings endpoint must not rewrite the operator's
+    real configuration file.
+    """
+    path = Path(path) if path is not None else settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
     return settings
