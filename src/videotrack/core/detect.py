@@ -45,10 +45,9 @@ AD_URL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"preroll|pre-roll|midroll|mid-roll|vast", re.IGNORECASE),
 ]
 
-STREAM_HOST_BONUS_PATTERNS: list[tuple[re.Pattern[str], int]] = [
-    (re.compile(r"tiktokcdn\.com$", re.IGNORECASE), 18),
-    (re.compile(r"bytecdn", re.IGNORECASE), 12),
-]
+# Host scoring hints are data, not policy, and specific CDN names are not core's
+# business. Callers pass them in; see videotrack.hosts for the shipped defaults.
+HostBonuses = tuple[tuple[str, int], ...]
 
 
 def _match_url(url: str) -> tuple[str, int] | None:
@@ -86,11 +85,11 @@ def _ad_url_penalty(url: str) -> int:
     return 0
 
 
-def _stream_host_bonus(host: str | None) -> int:
-    if not host:
+def _stream_host_bonus(host: str | None, host_bonuses: HostBonuses = ()) -> int:
+    if not host or not host_bonuses:
         return 0
-    for pattern, bonus in STREAM_HOST_BONUS_PATTERNS:
-        if pattern.search(host):
+    for pattern, bonus in host_bonuses:
+        if re.search(pattern, host, re.IGNORECASE):
             return bonus
     return 0
 
@@ -243,7 +242,11 @@ def precheck_hls_candidates(
     return sorted(candidates, key=lambda x: x.score, reverse=True)
 
 
-def detect_candidates(capture: CaptureResult, probe: bool = True) -> list[StreamCandidate]:
+def detect_candidates(
+    capture: CaptureResult,
+    probe: bool = True,
+    host_bonuses: HostBonuses = (),
+) -> list[StreamCandidate]:
     dedup: OrderedDict[str, StreamCandidate] = OrderedDict()
 
     for req in capture.requests:
@@ -275,7 +278,7 @@ def detect_candidates(capture: CaptureResult, probe: bool = True) -> list[Stream
             score += 5
 
         score -= _ad_url_penalty(req.url)
-        score += _stream_host_bonus((urlparse(req.url).hostname or "").lower() or None)
+        score += _stream_host_bonus((urlparse(req.url).hostname or "").lower() or None, host_bonuses)
 
         existing = dedup.get(req.url)
         if existing and existing.score >= score:

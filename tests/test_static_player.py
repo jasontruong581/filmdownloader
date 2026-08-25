@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from videotrack.static_player import extract_media_urls
+from videotrack.sites.vlxx import extract_media_urls
 
 
 class StaticPlayerExtractionTests(unittest.TestCase):

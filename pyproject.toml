@@ -10,10 +10,25 @@ requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31.0",
     "selenium>=4.20.0",
+    # Extractors go stale fast, so the floor tracks a recent release rather
+    # than the oldest version that imports.
+    "yt-dlp>=2026.8.19",
+]
+
+[project.optional-dependencies]
+# The CLI does not need a web stack, so the server is an extra.
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+dev = [
+    "pyflakes>=3.2",
+    "httpx2>=0.1",
 ]
 
 [project.scripts]
 filmdownloader = "videotrack.cli:main"
+filmdownloader-server = "videotrack.server.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

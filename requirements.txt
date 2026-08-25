@@ -1,2 +1,5 @@
 ﻿selenium>=4.20.0
 requests>=2.31.0
+yt-dlp>=2026.8.19
+fastapi>=0.110
+uvicorn[standard]>=0.29

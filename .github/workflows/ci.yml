@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[server,dev]"
+
+      # The suite must pass with no network, no Chrome, no FFmpeg, no yt-dlp
+      # extraction, and no built frontend. None of those are installed here, so
+      # a test that quietly depends on one fails the build.
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Lint
+        run: python -m pyflakes src/videotrack batch_run_csv.py main.py
+
+      - name: Core stays site-neutral
+        run: |
+          if grep -rniE 'vlxx|quatvn|xvideo|flowplayer|video-code|actress-tag|tiktokcdn|bytecdn' \
+             src/videotrack/core src/videotrack/engines src/videotrack/jobs src/videotrack/server \
+             --include='*.py'; then
+            echo "::error::site-specific reference found outside sites/"
+            exit 1
+          fi
+
+      - name: Core does not depend on yt-dlp
+        run: |
+          if grep -rn 'yt_dlp' src/videotrack/core --include='*.py'; then
+            echo "::error::core must not reference yt-dlp"
+            exit 1
+          fi
+
+      - name: Fixtures use reserved hostnames only
+        run: |
+          if grep -rniE 'https?://[a-z0-9.-]+\.(com|net|org|my|io)' tests/; then
+            echo "::error::tests must only use .example, .test, or .invalid hosts"
+            exit 1
+          fi
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Python package
+        run: pip install -e ".[server]"
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: web
+
+      # Types are generated from a dumped schema rather than a running server,
+      # so there is no port to race on. A drift means the committed types no
+      # longer describe the API, which would give the build false confidence.
+      - name: Check generated types are current
+        run: |
+          npm run gen:api
+          if ! git diff --quiet -- src/api/types.gen.ts; then
+            echo "::error::src/api/types.gen.ts is stale. Run 'npm run gen:api' and commit."
+            git diff -- src/api/types.gen.ts
+            exit 1
+          fi
+        working-directory: web
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+        working-directory: web
+
+      - name: Build
+        run: npm run build
+        working-directory: web
+
+      # A clean checkout must be able to start the server and answer health
+      # before anything site-specific or external is available.
+      - name: Server starts and reports health
+        run: |
+          python -m videotrack.server --port 8757 &
+          for _ in $(seq 1 30); do
+            if curl -fsS -H 'Host: 127.0.0.1:8757' http://127.0.0.1:8757/api/health > health.json; then
+              break
+            fi
+            sleep 1
+          done
+          cat health.json
+          python -c "import json; json.load(open('health.json'))['tools']"

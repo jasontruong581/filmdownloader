@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlparse
 
-from .models import CaptureResult, NetworkRequest
+from .models import CaptureResult, MediaFormat, NetworkRequest
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; FilmDownloader/1.0)"
 
@@ -18,6 +18,13 @@ class ResolvedMedia:
 
 @dataclass(frozen=True)
 class Resolution:
+    """What an engine learned about one downloadable item.
+
+    `media` carries directly fetchable URLs, which is all the FFmpeg path needs.
+    `formats` carries selectable renditions when the engine knows them; an engine
+    that only finds one URL leaves it empty and the pipeline behaves as before.
+    """
+
     resolver: str
     page_url: str
     final_url: str
@@ -25,6 +32,19 @@ class Resolution:
     media: tuple[ResolvedMedia, ...]
     user_agent: str = DEFAULT_USER_AGENT
     cookies: dict[str, str] | None = None
+    engine: str = ""
+    formats: tuple[MediaFormat, ...] = ()
+    duration: float | None = None
+    thumbnail: str | None = None
+    uploader: str | None = None
+    #: Set when the engine produced a real browser capture. The pipeline reuses
+    #: it verbatim so embed deep-scan and cross-domain cookies survive, instead
+    #: of a synthesized capture holding only the media URLs.
+    capture: CaptureResult | None = None
+
+    def __post_init__(self) -> None:
+        if not self.engine:
+            object.__setattr__(self, "engine", self.resolver)
 
 
 class Resolver(Protocol):
@@ -44,6 +64,10 @@ def media_kind(url: str) -> str:
 
 
 def capture_from_resolution(resolution: Resolution) -> CaptureResult:
+    """Shape a resolution into the capture the shared pipeline consumes."""
+    if resolution.capture is not None:
+        return resolution.capture
+
     requests = [
         NetworkRequest(
             url=item.url,

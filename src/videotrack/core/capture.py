@@ -3,25 +3,54 @@
 import json
 import time
 from collections import defaultdict
-
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from functools import lru_cache
+from typing import Any, NamedTuple
 
 from .models import CaptureResult, NetworkRequest
 
 
-def _build_driver(headless: bool) -> webdriver.Chrome:
-    options = Options()
+class SeleniumApi(NamedTuple):
+    """The Selenium names browser capture needs, resolved on first use."""
+
+    webdriver: Any
+    Options: Any
+    By: Any
+    EC: Any
+    WebDriverWait: Any
+
+
+@lru_cache(maxsize=1)
+def selenium_api() -> SeleniumApi:
+    """Import Selenium lazily so the package is usable without a browser stack.
+
+    Only browser capture needs Selenium. Importing it at module scope would make
+    the CLI, the resolver chain, and the server all require Chrome to be
+    installed before they could even start.
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.support.ui import WebDriverWait
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise RuntimeError(
+            "Browser capture needs Selenium, which is not installed. "
+            "Install it with: pip install selenium"
+        ) from exc
+    return SeleniumApi(webdriver, Options, By, EC, WebDriverWait)
+
+
+def _build_driver(headless: bool):
+    api = selenium_api()
+    options = api.Options()
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.add_argument("--window-size=1400,900")
     if headless:
         options.add_argument("--headless=new")
-    driver = webdriver.Chrome(options=options)
+    driver = api.webdriver.Chrome(options=options)
     driver.execute_cdp_cmd("Network.enable", {})
     return driver
 
@@ -33,7 +62,7 @@ def _normalize_headers(raw_headers: dict) -> dict[str, str]:
     return normalized
 
 
-def _try_play_in_current_context(driver: webdriver.Chrome) -> None:
+def _try_play_in_current_context(driver) -> None:
     try:
         driver.execute_script(
             """
@@ -82,14 +111,17 @@ def capture_page(
         driver.get(url)
 
         # Wait for body so we can attempt interactions safely.
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        api = selenium_api()
+        api.WebDriverWait(driver, 20).until(
+            api.EC.presence_of_element_located((api.By.TAG_NAME, "body"))
+        )
 
         if try_play:
             _try_play_in_current_context(driver)
 
             # Try interactions inside iframes as many players are embedded.
             try:
-                frames = driver.find_elements(By.TAG_NAME, "iframe")
+                frames = driver.find_elements(api.By.TAG_NAME, "iframe")
                 for frame in frames:
                     try:
                         driver.switch_to.frame(frame)

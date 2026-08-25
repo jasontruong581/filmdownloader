@@ -13,9 +13,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from videotrack.capture import capture_page
-from videotrack.download import download_with_ffmpeg
-from videotrack.quatvn import discover_quatvn_targets, extract_quatvn_stream_candidates, is_quatvn_stream_url, is_quatvn_url
+from videotrack.core.capture import capture_page
+from videotrack.core.download import download_with_ffmpeg
+from videotrack.sites.quatvn import discover_quatvn_targets, extract_quatvn_stream_candidates, is_quatvn_stream_url, is_quatvn_url
 
 BASE_FIELDNAMES = ["order", "id", "proceed_status", "url", "target_count", "completed_count", "last_error"]
 
@@ -24,13 +24,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run videotrack sequentially from CSV and mark downloaded rows.",
     )
-    parser.add_argument("--csv", default="output/vlxx_links.csv", help="Path to CSV file")
+    parser.add_argument("--csv", default="output/links.csv", help="Path to CSV file")
     parser.add_argument("--batch-size", type=int, default=10, help="Number of links per batch")
     parser.add_argument("--start-order", type=int, default=1, help="Minimum order to process")
     parser.add_argument("--output-dir", default="output", help="Output directory for videos")
     parser.add_argument("--wait", type=int, default=30, help="Wait seconds for analyze")
     parser.add_argument("--extra-wait", type=int, default=90, help="Extra wait seconds for deep scan")
-    parser.add_argument("--prefer-host", default="tiktokcdn.com", help="Preferred host")
+    parser.add_argument("--prefer-host", default="", help="Boost candidates from this host")
     parser.add_argument("--pick", type=int, default=1, help="Candidate pick index")
     parser.add_argument("--dump-all-candidates", default="logs/candidates_all.json", help="Dump all candidates path")
     parser.add_argument("--pending-value", default="not proceed", help="Status value for pending rows")
@@ -303,7 +303,7 @@ def _process_quatvn_row(
         candidate = next((item for item in quatvn_candidates if item.url == target), None)
         if candidate is None:
             row["last_error"] = f"missing_candidate={target}"
-            print(f"[!] missing candidate for target")
+            print(f"[!] missing candidate for target: {target}")
             continue
 
         if args.dry_run:

@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-from videotrack.collection import CollectionVideo, _existing_file_matches_source, parse_flowplayer_collection
+from videotrack.sites.flowplayer import CollectionVideo, _existing_file_matches_source, parse_flowplayer_collection
 
 
 class FlowplayerCollectionTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class FlowplayerCollectionTests(unittest.TestCase):
         self.assertEqual([video.title for video in collection.videos], ["Clip One", "Clip Two"])
         self.assertEqual(collection.videos[1].source_url, "https://cdn.example.test/two.m3u8")
 
-    @patch("videotrack.collection.requests.head")
+    @patch("videotrack.sites.flowplayer.requests.head")
     def test_resume_head_check_uses_collection_cookie(self, head) -> None:
         response = Mock()
         response.headers = {"content-length": "3"}

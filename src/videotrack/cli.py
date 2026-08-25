@@ -1,27 +1,49 @@
 ﻿from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
-from collections import OrderedDict
+import time
 from pathlib import Path
 
-from .capture import capture_page
-from .collection import download_collection, fetch_collection, parse_flowplayer_collection
-from .crawl import crawl_site_links, resolve_crawl_preset, save_urls_to_csv
-from .detect import (
-    build_request_headers,
-    detect_candidates,
-    extract_embed_urls,
-    filter_candidates_by_host,
-    precheck_hls_candidates,
+from .console import print_event
+from .core.capture import capture_page
+from .sites.flowplayer import download_collection, fetch_collection, parse_flowplayer_collection
+from .crawl import (
+    crawl_preset_choices,
+    crawl_site_links,
+    read_csv_urls,
+    resolve_crawl_preset,
+    save_urls_to_csv,
 )
-from .download import download_with_ffmpeg
-from .io import load_capture, save_candidates, save_capture, save_json
-from .models import CaptureResult, StreamCandidate
-from .resolvers import capture_from_resolution
-from .static_player import StaticPlayerResolver
+from .core.io import load_capture, save_candidates, save_capture, save_json
+from .core.models import CaptureResult, StreamCandidate
+from .core.options import PipelineOptions
+from .core.pipeline import (
+    download_with_fallback,
+    prepare_candidates,
+    resolve_download_capture,
+)
+from .core.pipeline import run as pipeline_run
+from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
+from .engines import ytdlp_version
+from .engines.batch import probe as batch_probe, sample_verify
+from .engines.browser_resolver import BrowserOptions
+from .engines.chain import (
+    DEFAULT_ENGINE_ORDER,
+    RESOLVER_ALIASES,
+    ChainOptions,
+    engine_choices,
+)
+from .engines.chain import resolve as chain_resolve
+from .engines.chain import resolve_by_engine
+from .engines.ytdlp_resolver import YtDlpOptions
+from .core.resolvers import capture_from_resolution
+from .hosts import DEFAULT_HOST_BONUSES
+from .jobs.bus import EventBus
+from .jobs.manager import DEFAULT_CONCURRENCY, DuplicateJob, JobManager
+from .jobs.models import TERMINAL_STATUSES, JobStatus
+from .jobs.store import JobStore
+from .sites import plugin_names
 
 
 def _add_shared_capture_args(parser: argparse.ArgumentParser) -> None:
@@ -47,197 +69,16 @@ def _apply_autonomous_overrides(args: argparse.Namespace) -> None:
         args.interactive_pick = False
 
 
-def _clone_candidate(candidate: StreamCandidate, source: str) -> StreamCandidate:
-    return StreamCandidate(
-        url=candidate.url,
-        kind=candidate.kind,
-        score=candidate.score,
-        source=source,
-        status_code=candidate.status_code,
-        content_type=candidate.content_type,
-        host=candidate.host,
-        probe_duration=candidate.probe_duration,
-        probe_bitrate=candidate.probe_bitrate,
-        validation_note=candidate.validation_note,
-        referer=candidate.referer,
-    )
-
-
-def _merge_candidates(
-    merged: OrderedDict[str, StreamCandidate],
-    incoming: list[StreamCandidate],
-    source: str,
-) -> None:
-    for candidate in incoming:
-        new_item = _clone_candidate(candidate, source)
-        existing = merged.get(new_item.url)
-        if existing is None:
-            merged[new_item.url] = new_item
-            continue
-
-        if source not in existing.source.split(","):
-            existing.source = f"{existing.source},{source}"
-
-        if new_item.score > existing.score:
-            existing.score = new_item.score
-            existing.kind = new_item.kind
-            existing.referer = new_item.referer
-
-        if new_item.status_code is not None:
-            existing.status_code = new_item.status_code
-        if new_item.content_type:
-            existing.content_type = new_item.content_type
-        if new_item.validation_note:
-            existing.validation_note = new_item.validation_note
-
-
-def _collect_candidates(
-    base_capture: CaptureResult,
-    probe: bool,
-    headed: bool,
-    wait_seconds: int,
-    extra_wait: int,
-) -> tuple[list[StreamCandidate], dict[str, int]]:
-    merged: OrderedDict[str, StreamCandidate] = OrderedDict()
-    stage_counts: dict[str, int] = {}
-
-    main_candidates = detect_candidates(capture=base_capture, probe=probe)
-    _merge_candidates(merged, main_candidates, "main")
-    stage_counts["main"] = len(main_candidates)
-
-    if main_candidates:
-        return sorted(merged.values(), key=lambda x: x.score, reverse=True), stage_counts
-
-    embed_urls = extract_embed_urls(base_capture)
-    stage_counts["embed_urls"] = len(embed_urls)
-
-    if embed_urls:
-        print(f"[i] No direct stream detected. Deep scan {len(embed_urls)} embed URL(s).")
-
-    for embed_idx, embed_url in enumerate(embed_urls[:3], start=1):
-        print(f"[i] Analyze embed: {embed_url}")
-        waits = [max(wait_seconds, 12)]
-        if extra_wait > 0:
-            waits.append(max(wait_seconds, 12) + extra_wait)
-
-        for phase, phase_wait in enumerate(waits, start=1):
-            stage = f"embed{embed_idx}_phase{phase}"
-            if len(waits) > 1:
-                print(f"[i] Embed phase {phase}/{len(waits)} wait={phase_wait}s")
-
-            embed_capture = capture_page(
-                url=embed_url,
-                wait_seconds=phase_wait,
-                headless=not headed,
-                try_play=True,
-            )
-            embed_candidates = detect_candidates(capture=embed_capture, probe=probe)
-            _merge_candidates(merged, embed_candidates, stage)
-            stage_counts[stage] = len(embed_candidates)
-
-    return sorted(merged.values(), key=lambda x: x.score, reverse=True), stage_counts
-
-
-def _probe_duration_seconds(path: Path) -> float | None:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        str(path),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout or "{}")
-        duration = float(data.get("format", {}).get("duration", 0))
-        return duration if duration > 0 else None
-    except Exception:
-        return None
-
-
-def _headers_block_for_ffprobe(capture: CaptureResult, candidate: StreamCandidate) -> str:
-    headers = build_request_headers(capture, candidate.referer)
-    headers.pop("User-Agent", None)
-    if not headers:
-        return ""
-    return "\r\n".join(f"{k}: {v}" for k, v in headers.items()) + "\r\n"
-
-
-def _probe_candidate_media(capture: CaptureResult, candidate: StreamCandidate) -> None:
-    cmd = ["ffprobe", "-v", "error"]
-
-    if capture.user_agent:
-        cmd.extend(["-user_agent", capture.user_agent])
-
-    header_block = _headers_block_for_ffprobe(capture, candidate)
-    if header_block:
-        cmd.extend(["-headers", header_block])
-
-    cmd.extend(
-        [
-            "-show_entries",
-            "format=duration,bit_rate",
-            "-of",
-            "json",
-            candidate.url,
-        ]
-    )
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout or "{}")
-        fmt = data.get("format", {})
-        duration = float(fmt.get("duration", 0) or 0)
-        bitrate = int(float(fmt.get("bit_rate", 0) or 0))
-
-        if duration > 0:
-            candidate.probe_duration = duration
-            if duration < 90:
-                candidate.score -= 45
-            elif duration < 180:
-                candidate.score -= 20
-            candidate.score += min(int(duration / 60), 80)
-        if bitrate > 0:
-            candidate.probe_bitrate = bitrate
-            candidate.score += min(int(bitrate / 500_000), 25)
-    except Exception:
-        return
-
-
-def _rank_candidates_with_ffprobe(
-    capture: CaptureResult,
-    candidates: list[StreamCandidate],
-    top_n: int,
-) -> list[StreamCandidate]:
-    for candidate in candidates[: max(top_n, 0)]:
-        _probe_candidate_media(capture, candidate)
-    return sorted(candidates, key=lambda x: x.score, reverse=True)
-
-
-def _boost_preferred_hosts(candidates: list[StreamCandidate], prefer_hosts: list[str]) -> list[StreamCandidate]:
-    if not prefer_hosts:
-        return candidates
-
-    normalized = [h.lower().strip() for h in prefer_hosts if h.strip()]
-    if not normalized:
-        return candidates
-
-    for candidate in candidates:
-        host = (candidate.host or "").lower()
-        if any(host == h or host.endswith(f".{h}") for h in normalized):
-            candidate.score += 35
-
-    return sorted(candidates, key=lambda x: x.score, reverse=True)
-
-
 def _serialize_candidates(candidates: list[StreamCandidate]) -> list[dict]:
     return [c.to_dict() for c in candidates]
 
 
 def _interactive_reorder(candidates: list[StreamCandidate]) -> list[StreamCandidate]:
+    """Prompt for a candidate choice.
+
+    Stays in the CLI: it reads stdin, and the pipeline must never be able to
+    block on a terminal.
+    """
     if not candidates:
         return candidates
 
@@ -269,126 +110,27 @@ def _interactive_reorder(candidates: list[StreamCandidate]) -> list[StreamCandid
     return [candidates[idx]] + candidates[:idx] + candidates[idx + 1 :]
 
 
-def _download_with_fallback(
-    capture: CaptureResult,
-    candidates: list[StreamCandidate],
-    pick: int,
-    output_dir: Path,
-    max_attempts: int,
-    min_duration: int,
-    interactive_pick: bool,
-    metadata_capture: CaptureResult | None = None,
-) -> int:
-    start = pick - 1 if pick > 0 and pick <= len(candidates) else 0
-    ordered = candidates[start:] + candidates[:start]
-
-    if interactive_pick:
-        ordered = _interactive_reorder(ordered)
-
-    attempts = min(max_attempts, len(ordered))
-
-    last_error: Exception | None = None
-    for idx, selected in enumerate(ordered[:attempts], start=1):
-        print(f"[+] Try {idx}/{attempts}: {selected.kind} | {selected.url}")
-        try:
-            out_file = download_with_ffmpeg(
-                capture=capture,
-                candidate=selected,
-                output_dir=output_dir,
-                metadata_capture=metadata_capture,
-            )
-            duration = _probe_duration_seconds(out_file)
-            if duration is not None and duration < float(min_duration):
-                print(
-                    f"[!] Reject short output ({duration:.1f}s < {min_duration}s). "
-                    "Try next candidate."
-                )
-                try:
-                    out_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                continue
-            print(f"[+] Downloaded: {out_file}")
-            return 0
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            print(f"[!] Failed candidate: {exc}")
-
-    print("[!] All candidate attempts failed.")
-    if last_error:
-        print(f"[!] Last error: {last_error}")
-    return 3
+def _pipeline_options(args: argparse.Namespace) -> PipelineOptions:
+    return PipelineOptions.from_args(args, host_bonuses=DEFAULT_HOST_BONUSES)
 
 
-def _prepare_candidates(
-    capture: CaptureResult,
-    probe: bool,
-    headed: bool,
-    wait_seconds: int,
-    extra_wait: int,
-    allow_hosts: list[str],
-    precheck_hls: bool,
-    rank_with_ffprobe: bool,
-    rank_top_n: int,
-    prefer_hosts: list[str],
-) -> tuple[list[StreamCandidate], dict[str, int], list[StreamCandidate]]:
-    all_candidates, stage_counts = _collect_candidates(
-        base_capture=capture,
-        probe=probe,
-        headed=headed,
-        wait_seconds=wait_seconds,
-        extra_wait=extra_wait,
+def _reorder_for(args: argparse.Namespace):
+    return _interactive_reorder if getattr(args, "interactive_pick", False) else None
+
+
+def _dump_candidates(args: argparse.Namespace, stage_counts, all_candidates, candidates) -> None:
+    target = getattr(args, "dump_all_candidates", "")
+    if not target:
+        return
+    save_json(
+        {
+            "stage_counts": stage_counts,
+            "all_candidates": _serialize_candidates(all_candidates),
+            "final_candidates": _serialize_candidates(candidates),
+        },
+        Path(target),
     )
-
-    selected = list(all_candidates)
-
-    if allow_hosts:
-        before = len(selected)
-        selected = filter_candidates_by_host(selected, allow_hosts)
-        print(f"[i] allow-host filter: {before} -> {len(selected)}")
-
-    if prefer_hosts and selected:
-        selected = _boost_preferred_hosts(selected, prefer_hosts)
-        print(f"[i] prefer-host boost applied: {', '.join(prefer_hosts)}")
-
-    if precheck_hls and selected:
-        selected = precheck_hls_candidates(selected, capture)
-
-    if rank_with_ffprobe and selected:
-        selected = _rank_candidates_with_ffprobe(capture, selected, rank_top_n)
-
-    return selected, stage_counts, all_candidates
-
-
-def _resolve_download_capture(
-    base_capture: CaptureResult,
-    candidates: list[StreamCandidate],
-    headed: bool,
-    wait_seconds: int,
-) -> CaptureResult:
-    if not candidates:
-        return base_capture
-
-    top = candidates[0]
-    if "embed" not in (top.source or ""):
-        return base_capture
-
-    embed_urls = extract_embed_urls(base_capture)
-    if not embed_urls:
-        return base_capture
-
-    embed_url = embed_urls[0]
-    print(f"[i] Refresh embed capture context for download: {embed_url}")
-    try:
-        return capture_page(
-            url=embed_url,
-            wait_seconds=max(wait_seconds, 15),
-            headless=not headed,
-            try_play=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[!] Embed recapture failed, fallback to base capture: {exc}")
-        return base_capture
+    print(f"[+] Saved dump: {target}")
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
@@ -407,29 +149,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 def cmd_detect(args: argparse.Namespace) -> int:
     _apply_autonomous_overrides(args)
     capture = load_capture(Path(args.capture))
-    candidates, stage_counts, all_candidates = _prepare_candidates(
-        capture=capture,
-        probe=not args.no_probe,
-        headed=args.headed,
-        wait_seconds=args.wait,
-        extra_wait=args.extra_wait,
-        allow_hosts=args.allow_host,
-        precheck_hls=not args.no_precheck_hls,
-        rank_with_ffprobe=not args.no_rank_with_ffprobe,
-        rank_top_n=args.rank_top_n,
-        prefer_hosts=args.prefer_host,
+    candidates, stage_counts, all_candidates = prepare_candidates(
+        capture, _pipeline_options(args), print_event
     )
 
     save_candidates(candidates, Path(args.candidates_out))
-    if args.dump_all_candidates:
-        save_json(
-            {
-                "stage_counts": stage_counts,
-                "all_candidates": _serialize_candidates(all_candidates),
-                "final_candidates": _serialize_candidates(candidates),
-            },
-            Path(args.dump_all_candidates),
-        )
+    _dump_candidates(args, stage_counts, all_candidates, candidates)
 
     print(f"[+] Candidates: {len(candidates)}")
     for idx, candidate in enumerate(candidates[:20], start=1):
@@ -438,132 +163,73 @@ def cmd_detect(args: argparse.Namespace) -> int:
             f"status={candidate.status_code} url={candidate.url}"
         )
     print(f"[+] Saved candidates: {args.candidates_out}")
-    if args.dump_all_candidates:
-        print(f"[+] Saved dump: {args.dump_all_candidates}")
     return 0
 
 
 def cmd_download(args: argparse.Namespace) -> int:
     _apply_autonomous_overrides(args)
     capture = load_capture(Path(args.capture))
-    candidates, stage_counts, all_candidates = _prepare_candidates(
-        capture=capture,
-        probe=not args.no_probe,
-        headed=args.headed,
-        wait_seconds=args.wait,
-        extra_wait=args.extra_wait,
-        allow_hosts=args.allow_host,
-        precheck_hls=not args.no_precheck_hls,
-        rank_with_ffprobe=not args.no_rank_with_ffprobe,
-        rank_top_n=args.rank_top_n,
-        prefer_hosts=args.prefer_host,
-    )
+    options = _pipeline_options(args)
 
-    if args.dump_all_candidates:
-        save_json(
-            {
-                "stage_counts": stage_counts,
-                "all_candidates": _serialize_candidates(all_candidates),
-                "final_candidates": _serialize_candidates(candidates),
-            },
-            Path(args.dump_all_candidates),
-        )
-        print(f"[+] Saved dump: {args.dump_all_candidates}")
+    candidates, stage_counts, all_candidates = prepare_candidates(capture, options, print_event)
+    _dump_candidates(args, stage_counts, all_candidates, candidates)
 
     if not candidates:
         print("[!] No stream candidate found.")
         return 2
 
-    download_capture = _resolve_download_capture(
-        base_capture=capture,
-        candidates=candidates,
-        headed=args.headed,
-        wait_seconds=args.wait,
-    )
-
-    return _download_with_fallback(
+    download_capture = resolve_download_capture(capture, candidates, options, print_event)
+    return download_with_fallback(
         download_capture,
         candidates,
-        args.pick,
-        Path(args.output_dir),
-        args.max_attempts,
-        args.min_duration,
-        args.interactive_pick,
+        options,
         metadata_capture=capture,
+        on_event=print_event,
+        reorder=_reorder_for(args),
     )
 
 
 def _run_capture_pipeline(args: argparse.Namespace, capture: CaptureResult) -> int:
     save_capture(capture, Path(args.capture_out))
-    candidates, stage_counts, all_candidates = _prepare_candidates(
-        capture=capture,
-        probe=not args.no_probe,
-        headed=args.headed,
-        wait_seconds=args.wait,
-        extra_wait=args.extra_wait,
-        allow_hosts=args.allow_host,
-        precheck_hls=not args.no_precheck_hls,
-        rank_with_ffprobe=not args.no_rank_with_ffprobe,
-        rank_top_n=args.rank_top_n,
-        prefer_hosts=args.prefer_host,
+    options = _pipeline_options(args)
+
+    code, candidates, stage_counts, all_candidates = pipeline_run(
+        capture, options, print_event, reorder=_reorder_for(args)
     )
     save_candidates(candidates, Path(args.candidates_out))
-
-    if args.dump_all_candidates:
-        save_json(
-            {
-                "stage_counts": stage_counts,
-                "all_candidates": _serialize_candidates(all_candidates),
-                "final_candidates": _serialize_candidates(candidates),
-            },
-            Path(args.dump_all_candidates),
-        )
-        print(f"[+] Saved dump: {args.dump_all_candidates}")
-
-    if not candidates:
-        print("[!] No stream candidate found after analysis.")
-        return 2
-
-    download_capture = _resolve_download_capture(
-        base_capture=capture,
-        candidates=candidates,
-        headed=args.headed,
-        wait_seconds=args.wait,
-    )
-
-    return _download_with_fallback(
-        download_capture,
-        candidates,
-        args.pick,
-        Path(args.output_dir),
-        args.max_attempts,
-        args.min_duration,
-        args.interactive_pick,
-        metadata_capture=capture,
-    )
+    _dump_candidates(args, stage_counts, all_candidates, candidates)
+    return code
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     _apply_autonomous_overrides(args)
-    if args.resolver in {"auto", "static"}:
-        resolution = StaticPlayerResolver().resolve(args.url)
-        if resolution:
-            capture = capture_from_resolution(resolution)
-            print(f"[+] Static resolver matched: {resolution.resolver} ({len(resolution.media)} candidate(s))")
-            result = _run_capture_pipeline(args, capture)
-            if result == 0 or args.resolver == "static":
-                return result
-            print("[i] Static download path failed; retrying with browser network capture.")
-        elif args.resolver == "static":
-            print("[!] Static resolver found no supported media on this page.")
-            return 2
+    options = _chain_options(args)
 
-    capture = capture_page(
-        url=args.url,
-        wait_seconds=args.wait,
-        headless=not args.headed,
-    )
-    return _run_capture_pipeline(args, capture)
+    attempted = False
+    last_result = 2
+    for engine_name, resolutions in resolve_by_engine(args.url, options):
+        attempted = True
+        resolution = resolutions[0]
+        if len(resolutions) > 1:
+            print(
+                f"[i] {engine_name} enumerated {len(resolutions)} items; downloading the first. "
+                "Use probe-batch to list them all."
+            )
+        print(f"[+] Engine {engine_name} resolved: {resolution.title or resolution.final_url}")
+        if resolution.formats:
+            print(f"[i] {len(resolution.formats)} selectable format(s); best: {resolution.formats[0].label()}")
+
+        capture = capture_from_resolution(resolution)
+        last_result = _run_capture_pipeline(args, capture)
+        if last_result == 0:
+            return 0
+        print(f"[i] {engine_name} download path failed; trying the next engine.")
+
+    if not attempted:
+        print("[!] No engine resolved media on this page.")
+        return 2
+    print("[!] Every engine that resolved this page failed to download it.")
+    return last_result
 
 
 def cmd_crawl_links(args: argparse.Namespace) -> int:
@@ -611,6 +277,249 @@ def cmd_collect(args: argparse.Namespace) -> int:
     print(f"[+] Collection: {collection.title}")
     print(f"[+] Items: {completed}/{manifest['expected_count']}")
     return 0 if completed == manifest["expected_count"] else 3
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    statuses = check_tools()
+
+    print("External tools")
+    print(format_report(statuses))
+
+    print("\nOptional Python packages")
+    ytdlp = ytdlp_version()
+    if ytdlp:
+        print(f"[ok  ] yt-dlp       {ytdlp}")
+        print("            extractors go stale quickly: pip install -U yt-dlp")
+    else:
+        print("[--  ] yt-dlp       not installed (optional)")
+
+    print("\nSite plugins")
+    print(f"  registered: {', '.join(plugin_names()) or 'none'}")
+    print(f"  crawl presets: {', '.join(crawl_preset_choices())}")
+
+    location = ffmpeg_location()
+    if location is not None:
+        print(f"\nFFmpeg location override: {location}")
+
+    blocking = [status.name for status in statuses if status.blocking]
+    if blocking:
+        print(f"\n[!] Missing required tool(s): {', '.join(blocking)}")
+        print(f"[i] Set {ENV_FFMPEG} to an ffmpeg directory or executable if it is installed elsewhere.")
+        return 1
+
+    print("\nAll required tools available.")
+    return 0
+
+
+def _chain_options(args: argparse.Namespace) -> ChainOptions:
+    """Build chain options from the flags, honoring the retired --resolver alias."""
+    engines = DEFAULT_ENGINE_ORDER
+    selected = getattr(args, "engine", None)
+    if selected:
+        engines = tuple(selected)
+    else:
+        legacy = getattr(args, "resolver", None)
+        if legacy:
+            engines = RESOLVER_ALIASES.get(legacy, DEFAULT_ENGINE_ORDER)
+
+    return ChainOptions(
+        engines=engines,
+        ytdlp=YtDlpOptions(cookies_from_browser=getattr(args, "cookies_from_browser", None) or None),
+        browser=BrowserOptions(
+            wait_seconds=getattr(args, "wait", 15),
+            headless=not getattr(args, "headed", False),
+        ),
+    )
+
+
+def cmd_list_formats(args: argparse.Namespace) -> int:
+    resolutions = chain_resolve(args.url, _chain_options(args))
+    if not resolutions:
+        print("[!] No engine resolved this URL.")
+        return 2
+
+    for index, resolution in enumerate(resolutions, start=1):
+        header = f"{index}. {resolution.title or resolution.final_url}"
+        print(f"\n{header}")
+        print(f"   engine={resolution.engine} duration={resolution.duration or '?'}")
+        if not resolution.formats:
+            print("   (this engine reports no selectable formats; it found direct media only)")
+            for media in resolution.media[:5]:
+                print(f"   - {media.kind:6} {media.url}")
+            continue
+        for fmt in resolution.formats:
+            print(f"   - {fmt.format_id:>8}  {fmt.label()}")
+    return 0
+
+
+def cmd_probe_batch(args: argparse.Namespace) -> int:
+    result = batch_probe(args.url)
+
+    print(f"capability : {result.capability}")
+    print(f"confidence : {result.confidence}")
+    print(f"items      : {len(result.items)}" + (f" of ~{result.total_estimate}" if result.total_estimate else ""))
+    if result.truncated:
+        print("             (list was capped; more items exist)")
+
+    if not result.is_batchable:
+        print("batchable  : no")
+        print(f"reason     : {result.reason}")
+        return 2
+
+    print("batchable  : yes")
+    if result.confidence == "possible":
+        print("note       : these are page links, not confirmed media")
+    for index, item in enumerate(result.items[:40], start=1):
+        print(f"  {index:3}. {item.title or item.url}")
+    if len(result.items) > 40:
+        print(f"  ... ({len(result.items) - 40} more)")
+
+    if args.verify:
+        verified, attempted = sample_verify(result.items, args.verify)
+        print(f"verified   : {verified}/{attempted} sampled item(s) resolve")
+    return 0
+
+
+def _open_manager(args: argparse.Namespace):
+    """Build a manager over the real store. Caller must shut it down."""
+    store = JobStore(getattr(args, "db", None) or None)
+    bus = EventBus()
+    manager = JobManager(
+        store=store,
+        bus=bus,
+        options=_pipeline_options(args),
+        concurrency=getattr(args, "concurrency", DEFAULT_CONCURRENCY),
+    )
+    return manager, store
+
+
+def _print_jobs(jobs) -> None:
+    if not jobs:
+        print("(no jobs)")
+        return
+    for job in jobs:
+        percent = f"{job.percent:5.1f}%" if job.percent is not None else "    ?"
+        print(f"{job.id[:8]}  {job.status.value:13} {percent}  {job.title or job.url}")
+        if job.error:
+            print(f"          error: {job.error}")
+
+
+def _drain_until_idle(manager, store, job_ids: list[str], timeout: float) -> int:
+    """Block until the given jobs leave the active statuses."""
+    deadline = time.monotonic() + timeout
+    pending = set(job_ids)
+    while pending and time.monotonic() < deadline:
+        for job_id in list(pending):
+            job = store.get(job_id)
+            if job is None or job.status in TERMINAL_STATUSES:
+                pending.discard(job_id)
+        if pending:
+            time.sleep(0.5)
+
+    failed = 0
+    for job_id in job_ids:
+        job = store.get(job_id)
+        if job is None:
+            continue
+        if job.status == JobStatus.COMPLETED:
+            print(f"[+] {job.id[:8]} {job.output_path}")
+        else:
+            failed += 1
+            print(f"[!] {job.id[:8]} {job.status.value}: {job.error or ''}")
+    return failed
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    manager, store = _open_manager(args)
+    try:
+        if args.queue_action == "list":
+            _print_jobs(store.list(status=args.status or None))
+            counts = store.counts_by_status()
+            if counts:
+                print("counts: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            return 0
+
+        if args.queue_action == "add":
+            urls = [url for url in args.url if url.strip()]
+            job_ids = []
+            for url in urls:
+                try:
+                    job = manager.submit(url)
+                except DuplicateJob as exc:
+                    print(f"[!] skip {url}: {exc}")
+                    continue
+                job_ids.append(job.id)
+                print(f"[+] queued {job.id[:8]} {url}")
+            if not job_ids:
+                return 2
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, job_ids, args.timeout) else 0
+            return 0
+
+        if args.queue_action == "batch":
+            result = batch_probe(args.url)
+            if not result.is_batchable:
+                print(f"[!] not batchable: {result.reason}")
+                return 2
+            if result.confidence == "possible" and not args.accept_possible:
+                print(f"[!] {len(result.items)} link(s) found, but these are page links, not confirmed media.")
+                print("[i] Re-run with --accept-possible to queue them anyway.")
+                return 2
+            items = result.items[: args.limit] if args.limit else result.items
+            batch, jobs, skipped = manager.submit_batch(
+                items,
+                source_url=args.url,
+                capability=result.capability,
+                confidence=result.confidence,
+            )
+            print(f"[+] batch {batch.id[:8]}: queued {len(jobs)}, skipped {len(skipped)}")
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, [j.id for j in jobs], args.timeout) else 0
+            return 0
+
+        if args.queue_action == "cancel":
+            return 0 if manager.cancel(args.job_id) else 2
+
+        if args.queue_action == "retry":
+            job = manager.retry(args.job_id)
+            if job is None:
+                print(f"[!] unknown job: {args.job_id}")
+                return 2
+            print(f"[+] requeued {job.id[:8]}")
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, [job.id], args.timeout) else 0
+            return 0
+
+        if args.queue_action == "import-csv":
+            urls = read_csv_urls(Path(args.csv))
+            print(f"[i] {len(urls)} URL(s) in {args.csv}")
+            if args.dry_run:
+                for url in urls[:40]:
+                    print(f"  would queue: {url}")
+                if len(urls) > 40:
+                    print(f"  ... ({len(urls) - 40} more)")
+                return 0
+            job_ids = []
+            for url in urls:
+                try:
+                    job_ids.append(manager.submit(url).id)
+                except DuplicateJob:
+                    continue
+            print(f"[+] queued {len(job_ids)} job(s)")
+            if args.wait:
+                return 3 if _drain_until_idle(manager, store, job_ids, args.timeout) else 0
+            return 0
+
+        if args.queue_action == "recover":
+            recovered = manager.recover_interrupted()
+            print(f"[i] marked {len(recovered)} job(s) interrupted")
+            return 0
+
+        print(f"[!] unknown queue action: {args.queue_action}")
+        return 2
+    finally:
+        manager.shutdown()
+        store.close()
 
 
 def _add_selection_flags(parser: argparse.ArgumentParser) -> None:
@@ -678,21 +587,97 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--extra-wait", type=int, default=45, help="Extra seconds for second deep-scan pass")
     p_run.add_argument("--no-probe", action="store_true")
     p_run.add_argument(
+        "--engine",
+        action="append",
+        choices=list(engine_choices()),
+        help="Engine chain to try, in order (repeatable). Default: yt-dlp, then site plugins, then browser",
+    )
+    p_run.add_argument(
         "--resolver",
-        choices=["auto", "static", "browser"],
+        choices=list(RESOLVER_ALIASES),
         default="auto",
-        help="Resolution strategy: static first, static only, or browser only",
+        help="Deprecated alias for --engine, kept for existing scripts",
+    )
+    p_run.add_argument(
+        "--format",
+        dest="format_id",
+        default="",
+        help="Format id to download, as listed by list-formats",
+    )
+    p_run.add_argument(
+        "--cookies-from-browser",
+        default="",
+        help="Reuse a browser profile's cookies, e.g. chrome (best effort, off by default)",
     )
     _add_autonomous_flag(p_run)
     _add_selection_flags(p_run)
     p_run.set_defaults(func=cmd_run)
+
+    p_doctor = sub.add_parser("doctor", help="Report external tool and plugin availability")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_formats = sub.add_parser("list-formats", help="Show the selectable formats an engine reports")
+    p_formats.add_argument("url", help="Page URL you are authorized to analyze")
+    p_formats.add_argument("--engine", action="append", choices=list(engine_choices()), help="Restrict the engine chain (repeatable, in order)")
+    p_formats.add_argument("--wait", type=int, default=15, help="Seconds to wait when the browser engine is used")
+    p_formats.add_argument("--headed", action="store_true", help="Run Chrome with UI when the browser engine is used")
+    p_formats.add_argument("--cookies-from-browser", default="", help="Reuse a browser profile's cookies, e.g. chrome (best effort)")
+    p_formats.set_defaults(func=cmd_list_formats)
+
+    p_probe = sub.add_parser("probe-batch", help="Check whether a URL enumerates multiple downloadable items")
+    p_probe.add_argument("url", help="Page URL you are authorized to analyze")
+    p_probe.add_argument("--verify", type=int, default=0, help="Fully resolve the first N items to raise confidence")
+    p_probe.set_defaults(func=cmd_probe_batch)
+
+    p_queue = sub.add_parser("queue", help="Manage the persistent download queue")
+    p_queue.add_argument("--db", default="", help="Job database path (default: the state directory)")
+    p_queue.add_argument("--output-dir", default="output", help="Where finished media goes")
+    p_queue.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="How many jobs run at once")
+    queue_sub = p_queue.add_subparsers(dest="queue_action", required=True)
+
+    q_add = queue_sub.add_parser("add", help="Queue one or more URLs")
+    q_add.add_argument("url", nargs="+", help="URLs you are authorized to download")
+    q_add.add_argument("--wait", action="store_true", help="Block until the queued jobs finish")
+    q_add.add_argument("--timeout", type=float, default=3600.0, help="Seconds to wait when --wait is used")
+
+    q_batch = queue_sub.add_parser("batch", help="Probe a URL and queue every item it enumerates")
+    q_batch.add_argument("url", help="Playlist, collection, or listing URL")
+    q_batch.add_argument("--limit", type=int, default=0, help="Queue at most N items (0 = all)")
+    q_batch.add_argument(
+        "--accept-possible",
+        action="store_true",
+        help="Also queue crawl-derived links, which are page links rather than confirmed media",
+    )
+    q_batch.add_argument("--wait", action="store_true", help="Block until the queued jobs finish")
+    q_batch.add_argument("--timeout", type=float, default=7200.0, help="Seconds to wait when --wait is used")
+
+    q_list = queue_sub.add_parser("list", help="Show queued and finished jobs")
+    q_list.add_argument("--status", default="", help="Filter by status")
+
+    q_cancel = queue_sub.add_parser("cancel", help="Cancel a job")
+    q_cancel.add_argument("job_id", help="Job id")
+
+    q_retry = queue_sub.add_parser("retry", help="Requeue a failed or interrupted job")
+    q_retry.add_argument("job_id", help="Job id")
+    q_retry.add_argument("--wait", action="store_true", help="Block until the job finishes")
+    q_retry.add_argument("--timeout", type=float, default=3600.0, help="Seconds to wait when --wait is used")
+
+    q_import = queue_sub.add_parser("import-csv", help="Queue every URL in a crawl CSV")
+    q_import.add_argument("csv", help="CSV produced by crawl-links")
+    q_import.add_argument("--dry-run", action="store_true", help="List what would be queued")
+    q_import.add_argument("--wait", action="store_true", help="Block until the queued jobs finish")
+    q_import.add_argument("--timeout", type=float, default=7200.0, help="Seconds to wait when --wait is used")
+
+    queue_sub.add_parser("recover", help="Mark jobs left running by a dead process as interrupted")
+
+    p_queue.set_defaults(func=cmd_queue)
 
     p_crawl = sub.add_parser("crawl-links", help="Crawl a website and export discovered child URLs to CSV")
     p_crawl.add_argument("url", help="Start URL to crawl")
     p_crawl.add_argument("--output-csv", default="output/links.csv", help="CSV output path")
     p_crawl.add_argument(
         "--site-preset",
-        choices=["auto", "generic", "vlxx", "quatvn"],
+        choices=list(crawl_preset_choices()),
         default="auto",
         help="Apply site-specific crawl rules. Default: auto-detect from the input URL host",
     )
