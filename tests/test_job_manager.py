@@ -11,11 +11,13 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from videotrack.core.events import DOWNLOAD_COMPLETED, PROGRESS, PipelineEvent, Progress, progress_event
 from videotrack.core.executor import DownloadCancelled
-from videotrack.core.models import BatchItem
+from videotrack.core.models import BatchItem, CaptureResult, NetworkRequest, StreamCandidate
 from videotrack.core.options import PipelineOptions
+from videotrack.core.resolvers import Resolution
 from videotrack.jobs.bus import EventBus
 from videotrack.jobs.manager import DuplicateJob, JobManager
 from videotrack.jobs.models import JobStatus
@@ -515,6 +517,171 @@ class RecoveryTests(_ManagerFixture):
 
         self.assertEqual([r.id for r in recovered], [job.id])
         self.assertEqual(self.store.get(job.id).status, JobStatus.INTERRUPTED)
+
+
+class DiscoveryDelegationTests(_ManagerFixture):
+    """The job runner has to find media the same way the CLI does.
+
+    A page that serves its stream from an embed yields no candidate on the outer
+    capture. Only the deep scan in the pipeline reaches the embed, so a runner
+    that calls detect_candidates by itself fails on exactly the pages the CLI
+    handles. These drive the real `_default_runner`, not an injected one.
+    """
+
+    def outer_capture(self) -> CaptureResult:
+        # A player frame, and deliberately no media request at this level.
+        return CaptureResult(
+            page_url="https://page.example.test/watch/1",
+            final_url="https://page.example.test/watch/1",
+            title="Embedded Clip",
+            user_agent="test-agent",
+            cookies={},
+            requests=[
+                NetworkRequest(
+                    url="https://frame.example.test/embed/abc",
+                    method="GET",
+                    headers={},
+                    resource_type="Document",
+                    status=200,
+                )
+            ],
+        )
+
+    def embed_capture(self, *media_urls: str) -> CaptureResult:
+        return CaptureResult(
+            page_url="https://frame.example.test/embed/abc",
+            final_url="https://frame.example.test/embed/abc",
+            title="Embedded Clip",
+            user_agent="test-agent",
+            cookies={},
+            requests=[
+                NetworkRequest(url=url, method="GET", headers={}, resource_type="Media", status=200)
+                for url in media_urls
+            ],
+        )
+
+    def discovering_manager(self) -> JobManager:
+        """A manager on the real runner, with every network-touching step off."""
+        manager = JobManager(
+            store=self.store,
+            bus=self.bus,
+            options=PipelineOptions(
+                output_dir=self.output_dir,
+                probe=False,
+                precheck_hls=False,
+                rank_with_ffprobe=False,
+                min_duration=0,
+            ),
+            concurrency=1,
+        )
+        self.addCleanup(manager.shutdown)
+        return manager
+
+    def browser_resolution(self, capture: CaptureResult) -> Resolution:
+        return Resolution(
+            resolver="browser",
+            page_url=capture.page_url,
+            final_url=capture.final_url,
+            title=capture.title,
+            media=(),
+            engine="browser",
+            capture=capture,
+        )
+
+    def recording_executor(self, calls: list, fail_urls: frozenset = frozenset()):
+        class _Executor:
+            name = "ffmpeg"
+
+            def __init__(self, duration_hint=None):
+                self.duration_hint = duration_hint
+
+            def run(self, request, cancel, on_event):
+                calls.append((request.candidate.url, self.duration_hint))
+                if request.candidate.url in fail_urls:
+                    raise RuntimeError("cdn refused this candidate")
+                request.out_file.parent.mkdir(parents=True, exist_ok=True)
+                request.out_file.write_bytes(b"media")
+                return request.out_file
+
+        return _Executor
+
+    def test_media_found_only_inside_an_embed_still_downloads(self) -> None:
+        calls: list = []
+        manager = self.discovering_manager()
+        resolution_id = manager.cache.put(self.browser_resolution(self.outer_capture()))
+        stream = "https://cdn.example.test/hls/master.m3u8"
+
+        with patch(
+            "videotrack.core.pipeline.capture_page", return_value=self.embed_capture(stream)
+        ), patch("videotrack.core.ffmpeg_executor.FfmpegExecutor", self.recording_executor(calls)):
+            job = manager.submit("https://page.example.test/watch/1", resolution_id=resolution_id)
+            self.wait_for_status(job.id, JobStatus.COMPLETED, JobStatus.FAILED)
+
+        record = self.store.get(job.id)
+        self.assertEqual(record.status, JobStatus.COMPLETED, record.error)
+        self.assertEqual([url for url, _hint in calls], [stream])
+
+    def test_a_probed_duration_reaches_the_executor_as_a_hint(self) -> None:
+        # Regression: the executor was built with no hint, so percent stayed None
+        # for the whole download even where the duration was already known.
+        calls: list = []
+        manager = self.discovering_manager()
+        resolution_id = manager.cache.put(self.browser_resolution(self.outer_capture()))
+        candidate = StreamCandidate(
+            url="https://cdn.example.test/hls/master.m3u8",
+            kind="hls",
+            score=10,
+            source="main",
+            probe_duration=612.0,
+        )
+
+        with patch(
+            "videotrack.core.pipeline.prepare_candidates",
+            return_value=([candidate], {}, [candidate]),
+        ), patch("videotrack.core.ffmpeg_executor.FfmpegExecutor", self.recording_executor(calls)):
+            job = manager.submit("https://page.example.test/watch/1", resolution_id=resolution_id)
+            self.wait_for_status(job.id, JobStatus.COMPLETED, JobStatus.FAILED)
+
+        self.assertEqual(self.store.get(job.id).status, JobStatus.COMPLETED)
+        self.assertEqual([hint for _url, hint in calls], [612.0])
+
+    def test_a_failing_candidate_falls_through_to_the_next(self) -> None:
+        calls: list = []
+        manager = self.discovering_manager()
+        resolution_id = manager.cache.put(self.browser_resolution(self.outer_capture()))
+        first = "https://cdn.example.test/hls/first.m3u8"
+        second = "https://cdn.example.test/hls/second.m3u8"
+
+        with patch(
+            "videotrack.core.pipeline.capture_page",
+            return_value=self.embed_capture(first, second),
+        ), patch(
+            "videotrack.core.ffmpeg_executor.FfmpegExecutor",
+            self.recording_executor(calls, fail_urls=frozenset({first})),
+        ):
+            job = manager.submit("https://page.example.test/watch/1", resolution_id=resolution_id)
+            self.wait_for_status(job.id, JobStatus.COMPLETED, JobStatus.FAILED)
+
+        record = self.store.get(job.id)
+        self.assertEqual(record.status, JobStatus.COMPLETED, record.error)
+        self.assertEqual([url for url, _hint in calls], [first, second])
+
+    def test_a_resolution_carrying_nothing_reports_that_plainly(self) -> None:
+        manager = self.discovering_manager()
+        empty = CaptureResult(
+            page_url="https://page.example.test/watch/2",
+            final_url="https://page.example.test/watch/2",
+            title="Nothing Here",
+            user_agent="test-agent",
+            cookies={},
+            requests=[],
+        )
+        resolution_id = manager.cache.put(self.browser_resolution(empty))
+
+        job = manager.submit("https://page.example.test/watch/2", resolution_id=resolution_id)
+        self.wait_for_status(job.id, JobStatus.FAILED)
+
+        self.assertIn("no media", self.store.get(job.id).error)
 
 
 if __name__ == "__main__":
