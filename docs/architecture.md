@@ -101,12 +101,16 @@ queued -> resolving -> downloading -> postprocessing -> completed
   timeout, since the worker pool and the API thread both write.
 - **Recovery**: a job left in an active status when the process died becomes
   `interrupted`. It is never reported as complete.
-- **Concurrency** is gated by a semaphore rather than the pool size, because a
-  `ThreadPoolExecutor` cannot shrink and the setting must apply without a
-  restart.
-- **Output paths are claimed at submission**, so two concurrent jobs cannot
-  derive the same name and race on one file. An active duplicate of the same URL
-  and format is refused.
+- **Concurrency** is gated by an admission count rather than the pool size,
+  because a `ThreadPoolExecutor` cannot shrink and the setting must apply
+  without a restart. Changing the limit never waits for a running job: lowering
+  it lets the excess finish and stops admitting replacements. Waiting there
+  deadlocked, since a worker needs the same lock to release its slot.
+- **Output paths are claimed at submission**, against both the filesystem and
+  the paths active jobs have already reserved. Existence alone is not enough:
+  nothing is written yet at submit time, so a filesystem check hands one name to
+  every job that derives it. An active duplicate of the same URL and format is
+  refused.
 - **Cancellation** is honest: FFmpeg and yt-dlp stop promptly, but a browser
   capture has no interruption hook, so cancellation lands between pipeline
   stages. The UI says "Cancelling" rather than pretending otherwise.
@@ -154,6 +158,12 @@ shadow `/api`: an unknown API path answers with a JSON 404, not the app shell.
 
 Resolution is capped separately from downloads and answers 429 when saturated,
 since it is slow and holds a worker.
+
+Configuration is layered, and the layers are read in one order: the `.env` file
+loads first at the entry point, real environment variables always win over it,
+and `settings.json` holds what the operator changed through the UI. The
+FFmpeg location has a single resolver so the Settings field and the environment
+variable cannot disagree about what was configured.
 
 Security: loopback bind plus a `Host` check by default, token required for any
 wider bind, and the server refuses to start on a wider bind without one. Library
