@@ -483,8 +483,12 @@ class JobManager:
         short = job.id[:8]
         if event.kind == PROGRESS:
             now = time.monotonic()
-            last = self._last_progress_log.get(job.id, 0.0)
-            if now - last < PROGRESS_LOG_INTERVAL_SECONDS:
+            last = self._last_progress_log.get(job.id)
+            # Absence means "never logged", which must always pass. A zero
+            # sentinel compared against a monotonic clock silently swallowed the
+            # first report on any machine whose uptime was below the interval -
+            # a fresh boot, or a CI runner.
+            if last is not None and now - last < PROGRESS_LOG_INTERVAL_SECONDS:
                 return
             self._last_progress_log[job.id] = now
             percent = event.payload.get("percent")

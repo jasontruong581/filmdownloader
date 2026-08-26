@@ -19,8 +19,8 @@ from unittest.mock import patch
 from videotrack.core.events import PROGRESS, PipelineEvent, Progress, progress_event
 from videotrack.core.options import PipelineOptions
 from videotrack.jobs.bus import EventBus
-from videotrack.jobs.manager import JobManager
-from videotrack.jobs.models import JobStatus
+from videotrack.jobs.manager import PROGRESS_LOG_INTERVAL_SECONDS, JobManager
+from videotrack.jobs.models import Job, JobStatus
 from videotrack.jobs.store import JobStore
 from videotrack.logs import DEFAULT_LEVEL, ENV_LOG_LEVEL, configure_logging, resolve_level
 
@@ -221,6 +221,67 @@ class JobEventLoggingTests(unittest.TestCase):
             )
 
         self.assertIn("unknown", "\n".join(captured.output))
+
+
+class ProgressThrottleClockTests(unittest.TestCase):
+    """The throttle must not depend on how long the machine has been up.
+
+    `_log_event` is driven directly here, with no worker thread, which is what
+    makes it safe to control the clock: patching `time.monotonic` for a threaded
+    test also reaches the waiting loop in the test itself.
+    """
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.store = JobStore(":memory:")
+        self.addCleanup(self.store.close)
+        self.manager = JobManager(
+            store=self.store,
+            bus=EventBus(),
+            options=PipelineOptions(output_dir=Path(self._temp.name)),
+            concurrency=1,
+            runner=lambda *args: Path(self._temp.name) / "unused.mp4",
+        )
+        self.addCleanup(self.manager.shutdown)
+        self.job = Job(url="https://page.example.test/w/1")
+
+    def log_at(self, seconds: float) -> list[str]:
+        event = progress_event(Progress(phase="downloading", percent=1.0))
+        with patch("videotrack.jobs.manager.time.monotonic", return_value=seconds):
+            with self.assertLogs("videotrack.jobs.manager", level="INFO") as captured:
+                self.manager._log_event(self.job, event)
+                # A record of its own, so assertLogs never fails for emptiness
+                # and the count below stays about progress alone.
+                logging.getLogger("videotrack.jobs.manager").info("marker")
+        return [line for line in captured.output if "downloading" in line]
+
+    def test_the_first_report_is_logged_on_a_freshly_booted_machine(self) -> None:
+        # Regression: the previous-timestamp default was zero, compared against a
+        # monotonic clock. Below the throttle interval - a fresh boot, or a CI
+        # runner - that arithmetic swallowed the first report of every job.
+        self.assertEqual(len(self.log_at(1.0)), 1)
+
+    def test_a_second_report_inside_the_interval_is_dropped(self) -> None:
+        self.log_at(1.0)
+
+        self.assertEqual(len(self.log_at(1.5)), 0)
+
+    def test_a_report_after_the_interval_is_logged_again(self) -> None:
+        self.log_at(1.0)
+
+        self.assertEqual(len(self.log_at(1.0 + PROGRESS_LOG_INTERVAL_SECONDS + 0.1)), 1)
+
+    def test_each_job_is_throttled_on_its_own(self) -> None:
+        self.log_at(1.0)
+        other = Job(url="https://page.example.test/w/2")
+        event = progress_event(Progress(phase="downloading", percent=1.0))
+
+        with patch("videotrack.jobs.manager.time.monotonic", return_value=1.5):
+            with self.assertLogs("videotrack.jobs.manager", level="INFO") as captured:
+                self.manager._log_event(other, event)
+
+        self.assertEqual(len([line for line in captured.output if "downloading" in line]), 1)
 
 
 if __name__ == "__main__":
