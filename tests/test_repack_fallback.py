@@ -262,6 +262,80 @@ class ExecutorFallbackTests(unittest.TestCase):
         self.assertEqual(self._kinds()[-1], DOWNLOAD_COMPLETED)
 
 
+class StrictnessProbeTargetTests(unittest.TestCase):
+    """The probe has to ask the same binary the command will run.
+
+    Resolving it from the environment alone meant an operator who configured
+    FFmpeg only in settings got no flags, so every playlist quietly took the
+    slower fallback instead of downloading directly. Measured at roughly a
+    seven-fold difference in throughput on a real stream.
+    """
+
+    def setUp(self) -> None:
+        download_module.hls_strictness_flags.cache_clear()
+        self.addCleanup(download_module.hls_strictness_flags.cache_clear)
+
+    def test_the_configured_location_reaches_the_probe(self) -> None:
+        with patch.object(download_module, "resolve_tool", return_value=None) as resolve:
+            download_module.hls_strictness_flags(r"C:\ffmpeg\bin")
+
+        resolve.assert_called_once()
+        name, location = resolve.call_args.args
+        self.assertEqual(name, "ffmpeg")
+        self.assertEqual(location, Path(r"C:\ffmpeg\bin"))
+
+    def test_no_location_falls_back_to_discovery(self) -> None:
+        with patch.object(download_module, "resolve_tool", return_value=None) as resolve:
+            download_module.hls_strictness_flags(None)
+
+        self.assertIsNone(resolve.call_args.args[1])
+
+    def test_an_unprobeable_ffmpeg_yields_no_flags(self) -> None:
+        # Guessing a flag an older build lacks makes FFmpeg exit before it
+        # downloads anything, so silence is the safe answer.
+        with patch.object(download_module, "resolve_tool", return_value=None), patch.object(
+            download_module.subprocess, "run", side_effect=OSError("no such binary")
+        ):
+            self.assertEqual(download_module.hls_strictness_flags("nowhere"), ())
+
+    def test_the_command_builder_threads_the_location_through(self) -> None:
+        with patch.object(
+            download_module, "hls_strictness_flags", return_value=()
+        ) as flags:
+            build_ffmpeg_command(
+                _capture(),
+                _candidate("https://cdn.example.test/a.m3u8", "hls"),
+                Path("out.mp4"),
+                r"C:\ffmpeg\bin",
+            )
+
+        flags.assert_called_once_with(r"C:\ffmpeg\bin")
+
+    def test_the_executor_passes_the_request_location(self) -> None:
+        captured: dict = {}
+
+        def fake_build(capture, candidate, out_file, ffmpeg_location=None):
+            captured["location"] = ffmpeg_location
+            return ["ffmpeg", "-i", candidate.url, str(out_file)]
+
+        request = DownloadRequest(
+            out_file=Path("out.mp4"),
+            capture=_capture(),
+            candidate=_candidate("https://cdn.example.test/a.m3u8", "hls"),
+            ffmpeg_location=r"C:\ffmpeg\bin",
+        )
+        with patch(
+            "videotrack.core.ffmpeg_executor.build_ffmpeg_command", side_effect=fake_build
+        ), patch("videotrack.core.ffmpeg_executor.subprocess.Popen", _FailingProcess), patch(
+            "videotrack.core.ffmpeg_executor.download_obfuscated_hls",
+            side_effect=RuntimeError("stop here"),
+        ):
+            with self.assertRaises(RuntimeError):
+                FfmpegExecutor().run(request, threading.Event(), lambda event: None)
+
+        self.assertEqual(captured["location"], r"C:\ffmpeg\bin")
+
+
 class RepackReportingTests(unittest.TestCase):
     """The repack must be usable from a server: no stdout, and interruptible."""
 
