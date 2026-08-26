@@ -1,12 +1,18 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import defaultdict
 from functools import lru_cache
 from typing import Any, NamedTuple
 
 from .models import CaptureResult, NetworkRequest
+
+#: Browser capture is the slowest thing this package does, by a wide margin, and
+#: it spends most of that time deliberately waiting. Logged rather than printed:
+#: core must stay usable from a server, where stdout is not a progress channel.
+logger = logging.getLogger(__name__)
 
 
 class SeleniumApi(NamedTuple):
@@ -105,9 +111,17 @@ def capture_page(
     headless: bool = True,
     try_play: bool = True,
 ) -> CaptureResult:
+    started = time.monotonic()
+
+    def elapsed() -> float:
+        return time.monotonic() - started
+
+    logger.info("capture: starting Chrome (%s)", "headless" if headless else "headed")
     driver = _build_driver(headless=headless)
+    logger.info("capture: Chrome ready in %.1fs", elapsed())
 
     try:
+        logger.info("capture: loading %s", url)
         driver.get(url)
 
         # Wait for body so we can attempt interactions safely.
@@ -115,6 +129,7 @@ def capture_page(
         api.WebDriverWait(driver, 20).until(
             api.EC.presence_of_element_located((api.By.TAG_NAME, "body"))
         )
+        logger.info("capture: page ready at %.1fs", elapsed())
 
         if try_play:
             _try_play_in_current_context(driver)
@@ -122,6 +137,8 @@ def capture_page(
             # Try interactions inside iframes as many players are embedded.
             try:
                 frames = driver.find_elements(api.By.TAG_NAME, "iframe")
+                if frames:
+                    logger.info("capture: trying playback in %d iframe(s)", len(frames))
                 for frame in frames:
                     try:
                         driver.switch_to.frame(frame)
@@ -133,6 +150,10 @@ def capture_page(
             except Exception:
                 pass
 
+        # The wait is the point, not a stall: media requests only appear once the
+        # player has actually started fetching. Announced so a long resolve does
+        # not look like a hang.
+        logger.info("capture: watching network for %ds", wait_seconds)
         time.sleep(wait_seconds)
 
         raw_logs = driver.get_log("performance")
@@ -188,6 +209,16 @@ def capture_page(
             pass
         user_agent = driver.execute_script("return navigator.userAgent")
         title = driver.title or ""
+
+        # Counts only. Cookie values belong nowhere near a log.
+        media_count = sum(1 for req in requests if req.resource_type == "Media")
+        logger.info(
+            "capture: done in %.1fs - %d request(s), %d media, %d cookie(s)",
+            elapsed(),
+            len(requests),
+            media_count,
+            len(cookies),
+        )
 
         return CaptureResult(
             page_url=url,

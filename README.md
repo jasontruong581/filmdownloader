@@ -70,6 +70,21 @@ frontend has not been built, so `python -m videotrack.server` plus
 For frontend development, `npm run dev` proxies `/api` to a server you start
 separately, giving hot reload against real data.
 
+### Seeing what it is doing
+
+Resolving a page that needs the browser fallback takes 30-60 seconds, and a deep
+scan of an embedded player can add a minute or two more. Both report each stage
+as they go, in two places:
+
+- **The console**, at `INFO` by default. `--log-level DEBUG` adds per-engine
+  decisions; `--log-level WARNING` reports only problems.
+- **The queue row**, which shows the current step in words and keeps a short log
+  you can expand. It is live only: the backend stores no event history, so a
+  reload starts the commentary over rather than pretending to recover it.
+
+A long wait is normal here. A silent one is what used to be indistinguishable
+from a hang.
+
 ### Security posture
 
 The server binds `127.0.0.1` by default and, on a loopback bind, rejects
@@ -176,6 +191,7 @@ authoritative.
 | `FILMDOWNLOADER_DB` | Job database path |
 | `FILMDOWNLOADER_TOKEN` | API token, required for a non-loopback bind |
 | `FILMDOWNLOADER_HOST` / `FILMDOWNLOADER_PORT` | Bind address |
+| `FILMDOWNLOADER_LOG_LEVEL` | Progress detail: `DEBUG`, `INFO` (default), `WARNING` |
 
 State lives outside the media output directory on purpose: the setting that
 names the output directory must not live inside the directory it names.

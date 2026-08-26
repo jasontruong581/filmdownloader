@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -42,6 +43,11 @@ from .store import JobStore
 
 DEFAULT_CONCURRENCY = 2
 MAX_POOL_WORKERS = 16
+
+#: Shortest gap between two progress lines in the log, per job. FFmpeg reports
+#: several times a second; unthrottled, those lines bury the stage messages that
+#: say what the work is actually doing.
+PROGRESS_LOG_INTERVAL_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,8 @@ class JobManager:
         #: Serializes claim-then-record. Kept apart from the manager lock so a
         #: submit never contends with admission or cancellation.
         self._claim_lock = threading.Lock()
+        #: Per job, when a progress line was last written to the log.
+        self._last_progress_log: dict[str, float] = {}
         self._pool = ThreadPoolExecutor(max_workers=MAX_POOL_WORKERS, thread_name_prefix="job")
         self._closed = False
         self.set_concurrency(self.concurrency)
@@ -458,4 +466,37 @@ class JobManager:
         from .models import JobEvent
         from .store import utcnow
 
+        self._log_event(job, event)
         self.bus.publish(JobEvent(job_id=job.id, batch_id=job.batch_id, event=event, created_at=utcnow()))
+
+    def _log_event(self, job: Job, event: PipelineEvent) -> None:
+        """Mirror an event to the server log.
+
+        The event stream only reaches a connected client. An operator watching
+        the console had no way to tell a multi-minute deep scan from a hang, so
+        the same events are written there too.
+
+        Progress is throttled: FFmpeg reports several times a second, and a wall
+        of near-identical lines hides the messages that actually say what stage
+        the work is in.
+        """
+        short = job.id[:8]
+        if event.kind == PROGRESS:
+            now = time.monotonic()
+            last = self._last_progress_log.get(job.id)
+            # Absence means "never logged", which must always pass. A zero
+            # sentinel compared against a monotonic clock silently swallowed the
+            # first report on any machine whose uptime was below the interval -
+            # a fresh boot, or a CI runner.
+            if last is not None and now - last < PROGRESS_LOG_INTERVAL_SECONDS:
+                return
+            self._last_progress_log[job.id] = now
+            percent = event.payload.get("percent")
+            where = event.payload.get("phase") or job.phase
+            shown = f"{percent:.1f}%" if isinstance(percent, (int, float)) else "unknown"
+            logger.info("job %s %s: %s", short, where, shown)
+            return
+
+        message = event.payload.get("message") or event.payload.get("error") or ""
+        detail = f" - {message}" if message else ""
+        logger.info("job %s %s%s", short, event.kind, detail)

@@ -16,11 +16,55 @@ const RECONNECT_MAX_MS = 30_000;
 type JobEventPayload = {
   job_id: string;
   batch_id?: string | null;
+  created_at?: string;
   kind: string;
   payload: Record<string, unknown>;
 };
 
 export type ConnectionState = "connecting" | "live" | "offline";
+
+export type ActivityEntry = { at: string; text: string };
+
+/**
+ * Kept in memory only, and capped. This is a running commentary on work in
+ * flight, not a record: the backend persists no event history, so a reload
+ * legitimately starts the commentary over rather than pretending to recover it.
+ */
+const ACTIVITY_LIMIT = 40;
+
+/** A line worth showing a human, or null for events that only move numbers. */
+function describeEvent(event: JobEventPayload): string | null {
+  const payload = event.payload ?? {};
+  const message = typeof payload.message === "string" ? payload.message : "";
+
+  if (event.kind === "progress") return null;
+
+  switch (event.kind) {
+    case "info":
+      return message || null;
+    case "stage_started":
+      return message || `Stage ${String(payload.stage ?? "")}`;
+    case "candidates_found":
+      return `Found ${Number(payload.count ?? 0)} candidate(s).`;
+    case "candidate_attempt":
+      return `Trying candidate ${Number(payload.index ?? 0)} of ${Number(payload.total ?? 0)}.`;
+    case "candidate_rejected": {
+      const reason = typeof payload.reason === "string" ? payload.reason : "rejected";
+      const detail = typeof payload.error === "string" ? `: ${payload.error}` : "";
+      return `Candidate rejected (${reason})${detail}`;
+    }
+    case "download_completed":
+      return "Download finished.";
+    case "failed":
+      return typeof payload.error === "string" ? `Failed: ${payload.error}` : "Failed.";
+    default:
+      if (event.kind.startsWith("job_")) {
+        const status = typeof payload.status === "string" ? payload.status : event.kind.slice(4);
+        return `Job ${status}.`;
+      }
+      return message || null;
+  }
+}
 
 function applyEvent(job: Job, event: JobEventPayload): Job {
   const payload = event.payload ?? {};
@@ -59,6 +103,7 @@ function applyEvent(job: Job, event: JobEventPayload): Job {
 
 export function useJobs() {
   const [jobs, setJobs] = useState<Map<string, Job>>(new Map());
+  const [activity, setActivity] = useState<Map<string, ActivityEntry[]>>(new Map());
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<string>("");
   const attemptRef = useRef(0);
@@ -99,6 +144,17 @@ export function useJobs() {
       source.onmessage = (message) => {
         try {
           const event = JSON.parse(message.data) as JobEventPayload;
+
+          const line = describeEvent(event);
+          if (line) {
+            setActivity((current) => {
+              const next = new Map(current);
+              const kept = [...(next.get(event.job_id) ?? []), { at: event.created_at ?? "", text: line }];
+              next.set(event.job_id, kept.slice(-ACTIVITY_LIMIT));
+              return next;
+            });
+          }
+
           setJobs((current) => {
             const existing = current.get(event.job_id);
             if (!existing) {
@@ -152,5 +208,5 @@ export function useJobs() {
     });
   }, []);
 
-  return { all, active, finished, connection, error, refresh: reconcile, mutate };
+  return { all, active, finished, activity, connection, error, refresh: reconcile, mutate };
 }
