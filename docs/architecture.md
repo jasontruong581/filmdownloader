@@ -71,6 +71,25 @@ Three facts the shape has to respect, learned from what the tools actually emit:
   `MonotonicProgress` folds them into one non-decreasing track, instead of
   showing progress reach 100 percent twice and then stall.
 
+### Two consumers, one vocabulary
+
+Progress reaches a human two ways, and both read the same events rather than
+inventing their own reporting:
+
+- **The event stream**, per job, over SSE. Live only, no replay.
+- **The console**, through `logging`. Core never prints: stdout is data for the
+  CLI and not a progress channel for a server, so every stage is a log record and
+  the entry point decides whether to show it.
+
+The job layer mirrors each event it publishes into the log, with progress
+throttled per job. Unthrottled, FFmpeg's several-times-a-second reports bury the
+stage messages that say what the work is actually doing.
+
+Browser capture logs its own stages, because it is where the time goes: starting
+Chrome, loading the page, and then a deliberate wait for media requests that no
+amount of optimism will shorten. A silent minute there is indistinguishable from
+a hang, which is enough to get a working download killed halfway.
+
 ## The pipeline
 
 `core.pipeline` performs candidate collection, filtering, ranking, and download

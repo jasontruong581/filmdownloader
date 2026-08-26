@@ -10,6 +10,7 @@ import webbrowser
 from .app import create_app, openapi_json
 from .security import InsecureConfiguration
 from ..core.env import load_env_file
+from ..logs import ENV_LOG_LEVEL, configure_logging
 from .settings import load_settings
 
 
@@ -24,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Write the OpenAPI schema to this path and exit, without starting a server",
     )
+    parser.add_argument(
+        "--log-level",
+        default="",
+        help=f"Progress detail: DEBUG, INFO, WARNING. Default INFO, or ${ENV_LOG_LEVEL}",
+    )
     return parser
 
 
@@ -34,11 +40,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.dump_openapi:
+        # No handler here: stdout is the deliverable and stderr should stay quiet.
         from pathlib import Path
 
         Path(args.dump_openapi).write_text(openapi_json(), encoding="utf-8")
         print(f"[+] wrote {args.dump_openapi}")
         return 0
+
+    level = configure_logging(args.log_level)
 
     settings = load_settings()
     if args.host:
@@ -54,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
 
     url = f"http://{settings.host}:{settings.port}/"
     print(f"[+] Serving on {url}")
+    print(f"[i] Progress detail: {level}. A browser capture takes 30-60s and says so as it goes.")
     if not settings.is_loopback:
         print("[i] Bound off loopback; every /api request needs the configured token.")
 

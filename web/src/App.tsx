@@ -95,6 +95,7 @@ export function App() {
           <QueueView
             active={jobs.active}
             finished={jobs.finished}
+            activity={jobs.activity}
             connection={jobs.connection}
             error={jobs.error}
             onChanged={jobs.mutate}

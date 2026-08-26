@@ -25,6 +25,7 @@ from .core.pipeline import (
 )
 from .core.pipeline import run as pipeline_run
 from .core.env import load_env_file
+from .logs import configure_logging
 from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
 from .engines import ytdlp_version
 from .engines.batch import probe as batch_probe, sample_verify
@@ -719,6 +720,9 @@ def main(argv: list[str] | None = None) -> int:
     # Before the parser builds its defaults from the paths module, so the
     # documented `.env` file actually reaches them.
     load_env_file()
+    # Progress records go to stderr, so stdout stays usable as data for the
+    # commands whose output is meant to be piped.
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

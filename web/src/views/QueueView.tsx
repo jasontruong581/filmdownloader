@@ -11,11 +11,12 @@ import { useMemo } from "react";
 import { api, type Job } from "../api/client";
 import { Banner } from "../components/Banner";
 import { JobRow } from "../components/JobRow";
-import type { ConnectionState } from "../api/useJobs";
+import type { ActivityEntry, ConnectionState } from "../api/useJobs";
 
 type Props = {
   active: Job[];
   finished: Job[];
+  activity: Map<string, ActivityEntry[]>;
   connection: ConnectionState;
   error: string;
   onChanged: (job: Job) => void;
@@ -28,7 +29,15 @@ const CONNECTION_LABELS: Record<ConnectionState, string> = {
   offline: "reconnecting…",
 };
 
-export function QueueView({ active, finished, connection, error, onChanged, onRefresh }: Props) {
+export function QueueView({
+  active,
+  finished,
+  activity,
+  connection,
+  error,
+  onChanged,
+  onRefresh,
+}: Props) {
   const batches = useMemo(() => {
     const map = new Map<string, Job[]>();
     for (const job of [...active, ...finished]) {
@@ -96,7 +105,13 @@ export function QueueView({ active, finished, connection, error, onChanged, onRe
         ) : (
           <ul className="space-y-2">
             {active.map((job) => (
-              <JobRow key={job.id} job={job} onCancel={cancel} onRetry={retry} />
+              <JobRow
+                key={job.id}
+                job={job}
+                activity={activity.get(job.id)}
+                onCancel={cancel}
+                onRetry={retry}
+              />
             ))}
           </ul>
         )}
@@ -109,7 +124,13 @@ export function QueueView({ active, finished, connection, error, onChanged, onRe
         ) : (
           <ul className="space-y-2">
             {finished.map((job) => (
-              <JobRow key={job.id} job={job} onCancel={cancel} onRetry={retry} />
+              <JobRow
+                key={job.id}
+                job={job}
+                activity={activity.get(job.id)}
+                onCancel={cancel}
+                onRetry={retry}
+              />
             ))}
           </ul>
         )}
