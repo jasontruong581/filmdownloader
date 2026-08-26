@@ -106,6 +106,55 @@ class FailureIsolationTests(unittest.TestCase):
             self.assertEqual(chain.resolve("https://page.example.test/"), [])
 
 
+class FailureVisibilityTests(unittest.TestCase):
+    """A broken engine must not stop the chain, and must not be silent either.
+
+    At debug level a failing engine was indistinguishable from a page no engine
+    supports. Those are different problems with different fixes, and telling
+    them apart from a server log is the whole point.
+    """
+
+    def test_a_raising_engine_is_logged_at_warning(self) -> None:
+        def exploding(url, options):
+            raise RuntimeError("chromedriver went missing")
+
+        with patch.object(chain, "_runner_for", return_value=exploding):
+            with self.assertLogs("videotrack.engines.chain", level="WARNING") as captured:
+                results = chain.resolve("https://page.example.test/x")
+
+        self.assertEqual(results, [])
+        joined = "\n".join(captured.output)
+        self.assertIn("chromedriver went missing", joined)
+        self.assertIn("RuntimeError", joined)
+
+    def test_an_unknown_engine_name_is_logged_at_warning(self) -> None:
+        # A typo in the engine setting otherwise does nothing at all, visibly.
+        with patch.object(chain, "_runner_for", return_value=None):
+            with self.assertLogs("videotrack.engines.chain", level="WARNING") as captured:
+                chain.resolve("https://page.example.test/x", chain.ChainOptions(engines=("nope",)))
+
+        self.assertIn("nope", "\n".join(captured.output))
+
+    def test_a_later_engine_still_runs_after_an_earlier_one_fails(self) -> None:
+        def runner_for(name: str):
+            if name == "ytdlp":
+                def exploding(url, options):
+                    raise RuntimeError("extractor blew up")
+
+                return exploding
+
+            def working(url, options):
+                return [_resolution(name)]
+
+            return working
+
+        with patch.object(chain, "_runner_for", side_effect=runner_for):
+            with self.assertLogs("videotrack.engines.chain", level="WARNING"):
+                results = chain.resolve("https://page.example.test/x")
+
+        self.assertEqual([item.engine for item in results], ["site"])
+
+
 class SiteEngineTests(unittest.TestCase):
     def test_a_raising_site_resolver_is_skipped_for_the_next_one(self) -> None:
         class Broken:

@@ -107,12 +107,22 @@ def resolve_by_engine(url: str, options: ChainOptions | None = None):
     for engine_name in options.engines:
         runner = _runner_for(engine_name)
         if runner is None:
-            logger.debug("unknown engine %r, skipping", engine_name)
+            logger.warning("unknown engine %r, skipping", engine_name)
             continue
         try:
             results = runner(url, options)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("engine %s raised on %s: %s", engine_name, url, exc)
+            # A broken engine still must not stop the chain, but it must not be
+            # invisible either: at debug level this was indistinguishable from
+            # "the page is not supported", which is a different problem with a
+            # different fix.
+            logger.warning(
+                "engine %s failed on %s: %s: %s",
+                engine_name,
+                url,
+                type(exc).__name__,
+                exc,
+            )
             continue
         if results:
             yield engine_name, results

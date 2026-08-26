@@ -102,7 +102,9 @@ class FfmpegExecutor:
         except OSError:
             pass
 
-        cmd = build_ffmpeg_command(request.capture, request.candidate, part_file)
+        cmd = build_ffmpeg_command(
+            request.capture, request.candidate, part_file, request.ffmpeg_location
+        )
         cmd = _with_progress_flags(_resolved_binary(cmd, request.ffmpeg_location))
 
         parser = FfmpegProgressParser(duration_seconds=self.duration_hint, phase=PHASE_DOWNLOADING)

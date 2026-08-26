@@ -96,8 +96,8 @@ def is_hls_candidate(candidate: StreamCandidate) -> bool:
     return candidate.kind in {"hls", "playlist"} or ".m3u8" in url or "manifest" in url
 
 
-@lru_cache(maxsize=1)
-def hls_strictness_flags() -> tuple[str, ...]:
+@lru_cache(maxsize=8)
+def hls_strictness_flags(ffmpeg_location: str | None = None) -> tuple[str, ...]:
     """Flags that relax the HLS demuxer, limited to what this FFmpeg accepts.
 
     FFmpeg 7.1 added `extension_picky`, on by default, which rejects a segment
@@ -107,8 +107,15 @@ def hls_strictness_flags() -> tuple[str, ...]:
 
     Probed rather than assumed: passing an option an older build does not have
     makes it exit before downloading anything.
+
+    The location is a parameter because the probe has to ask the *same* binary
+    the command will run. Resolving it from the environment alone meant an
+    operator who configured FFmpeg only in settings got no flags, and every
+    playlist quietly took a slower fallback path instead of downloading
+    directly.
     """
-    binary = resolve_tool("ffmpeg") or "ffmpeg"
+    location = Path(ffmpeg_location).expanduser() if ffmpeg_location else None
+    binary = resolve_tool("ffmpeg", location) or "ffmpeg"
     try:
         result = subprocess.run(
             [binary, "-hide_banner", "-h", "demuxer=hls"],
@@ -193,6 +200,7 @@ def build_ffmpeg_command(
     capture: CaptureResult,
     candidate: StreamCandidate,
     out_file: Path,
+    ffmpeg_location: str | None = None,
 ) -> list[str]:
     cmd = [
         "ffmpeg",
@@ -218,7 +226,7 @@ def build_ffmpeg_command(
                 "ALL",
             ]
         )
-        cmd.extend(hls_strictness_flags())
+        cmd.extend(hls_strictness_flags(ffmpeg_location))
 
     cmd.extend(
         [
