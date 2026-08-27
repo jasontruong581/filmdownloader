@@ -156,7 +156,7 @@ class ExecutorFallbackTests(unittest.TestCase):
     def test_a_refused_playlist_falls_through_to_the_repack(self) -> None:
         # Regression: this raised instead, so a stream only the repack can read
         # was reported as a dead candidate.
-        def fake_repack(capture, candidate, out_file, cancel=None, on_progress=None):
+        def fake_repack(capture, candidate, out_file, cancel=None, on_progress=None, ffmpeg_location=None):
             if on_progress is not None:
                 on_progress(1, 2)
                 on_progress(2, 2)
@@ -181,7 +181,7 @@ class ExecutorFallbackTests(unittest.TestCase):
     def test_the_repack_receives_the_cancel_event(self) -> None:
         seen: dict = {}
 
-        def fake_repack(capture, candidate, out_file, cancel=None, on_progress=None):
+        def fake_repack(capture, candidate, out_file, cancel=None, on_progress=None, ffmpeg_location=None):
             seen["cancel"] = cancel
             out_file.write_bytes(b"repacked")
             return out_file

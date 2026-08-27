@@ -257,6 +257,7 @@ class FfmpegExecutor:
                 request.out_file,
                 cancel=cancel,
                 on_progress=report,
+                ffmpeg_location=request.ffmpeg_location,
             )
         except DownloadCancelled:
             raise

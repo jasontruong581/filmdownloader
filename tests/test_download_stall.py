@@ -345,7 +345,7 @@ class StallWatchdogTests(unittest.TestCase):
     def test_a_stalled_playlist_still_reaches_the_repack(self) -> None:
         # A stall is a failed attempt, not a dead candidate: the segment fetcher
         # has its own per-request timeouts and may well succeed.
-        def fake_repack(capture, candidate, out_file, cancel=None, on_progress=None):
+        def fake_repack(capture, candidate, out_file, cancel=None, on_progress=None, ffmpeg_location=None):
             out_file.write_bytes(b"repacked")
             return out_file
 

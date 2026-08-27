@@ -20,7 +20,7 @@ from ..jobs.bus import EventBus
 from ..jobs.cache import ResolutionCache
 from ..jobs.manager import JobManager
 from ..jobs.store import JobStore
-from .settings import Settings, save_settings
+from .settings import Settings, publish_ffmpeg_location, save_settings
 
 #: Resolution is slow and holds a worker, so it is capped separately from
 #: downloads and saturation answers 429 rather than queueing indefinitely.
@@ -46,6 +46,7 @@ class ServerState:
         resolve_slots: int = DEFAULT_RESOLVE_SLOTS,
         settings_path: Path | str | None = None,
     ) -> "ServerState":
+        publish_ffmpeg_location(settings)
         store = JobStore(db_path if db_path is not None else state_dir() / "jobs.db")
         bus = EventBus()
         cache = ResolutionCache()
@@ -83,6 +84,7 @@ class ServerState:
 
     def apply_settings(self, settings: Settings) -> Settings:
         self.settings = save_settings(settings, self.settings_file)
+        publish_ffmpeg_location(self.settings)
         self.manager.options = self.pipeline_options(settings)
         self.manager.set_concurrency(settings.concurrency)
         return self.settings
