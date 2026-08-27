@@ -16,6 +16,7 @@ not.
 from __future__ import annotations
 
 import os
+import stat
 import threading
 import unittest
 from pathlib import Path
@@ -229,8 +230,13 @@ class PublishedLocationTests(unittest.TestCase):
         # the whole point: with FFmpeg configured in Settings and absent from
         # PATH, they used to come back empty.
         with TemporaryDirectory() as fake_bin:
-            binary = Path(fake_bin) / "ffprobe.exe"
+            # Named and marked for the host platform: resolution goes through
+            # shutil.which, which wants PATHEXT on Windows and the execute bit
+            # everywhere else. A Windows-shaped stub is simply invisible on the
+            # Linux the CI runs.
+            binary = Path(fake_bin) / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
             binary.write_bytes(b"")
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
             publish_ffmpeg_location(Settings(ffmpeg_location=fake_bin))
             found = resolve_tool("ffprobe")
