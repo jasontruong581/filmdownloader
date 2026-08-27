@@ -49,7 +49,30 @@ MAX_POOL_WORKERS = 16
 #: say what the work is actually doing.
 PROGRESS_LOG_INTERVAL_SECONDS = 5.0
 
+#: How much of an event message reaches the log.
+#:
+#: One failure is mirrored at three levels - the executor reports it, the
+#: candidate loop rejects the candidate with it, and the job fails with it - so
+#: an unbounded multi-line error printed the same wall of text three times and
+#: buried every other line. The job record keeps the message in full, which is
+#: what the UI shows; the log gets one line worth scanning.
+LOGGED_MESSAGE_LIMIT = 200
+
 logger = logging.getLogger(__name__)
+
+
+def _for_log(message: object) -> str:
+    """One bounded line, with the amount withheld stated rather than implied.
+
+    Collapsing the newlines matters as much as the length: a multi-line error
+    breaks the one-record-per-line shape the rest of the log has, so a reader
+    scanning for the next stage has to find where the message ended.
+    """
+    single = " ".join(str(message).split())
+    if len(single) <= LOGGED_MESSAGE_LIMIT:
+        return single
+    hidden = len(single) - LOGGED_MESSAGE_LIMIT
+    return f"{single[:LOGGED_MESSAGE_LIMIT].rstrip()}... (+{hidden} more chars, full text on the job)"
 
 #: Injected so tests can drive the manager without FFmpeg, yt-dlp, or Chrome.
 Runner = Callable[[Job, Resolution | None, threading.Event, Callable[[PipelineEvent], None]], Path]
@@ -498,5 +521,5 @@ class JobManager:
             return
 
         message = event.payload.get("message") or event.payload.get("error") or ""
-        detail = f" - {message}" if message else ""
+        detail = f" - {_for_log(message)}" if message else ""
         logger.info("job %s %s%s", short, event.kind, detail)

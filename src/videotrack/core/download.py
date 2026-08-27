@@ -23,7 +23,77 @@ from .executor import DownloadCancelled
 from .models import CaptureResult, PageMetadata, StreamCandidate
 from .preflight import resolve_tool
 
-FFMPEG_STDERR_TAIL_LINES = 12
+#: How much of FFmpeg stderr to hold on to while an attempt runs.
+#:
+#: Generous, because FFmpeg states the reason it is refusing a stream while it
+#: parses, and only afterwards describes whatever it did manage to read. A short
+#: window keeps the description and loses the reason.
+FFMPEG_STDERR_KEEP_LINES = 200
+
+#: How many lines of diagnosis to hand back. A failure worth reading is a
+#: sentence or two; a wall of text is what made the last one unreadable.
+FFMPEG_ERROR_REPORT_LINES = 4
+
+#: Substrings that mark a line as a diagnosis rather than a description.
+#: Matched case-insensitively against whole lines of FFmpeg output.
+FAULT_HINTS: tuple[str, ...] = (
+    "error",
+    "invalid",
+    "failed",
+    "unable to",
+    "not found",
+    "no such",
+    "denied",
+    "forbidden",
+    "unauthorized",
+    "not rfc",
+    "not in allowed",
+    "unsupported",
+    "could not",
+    "cannot",
+    "timed out",
+    "refused",
+    "server returned",
+    "end of file",
+    "protocol not",
+    "conversion failed",
+    "moov atom",
+    "connection reset",
+    #: Not FFmpeg's word. The executor appends it when it abandons a transfer
+    #: that stopped delivering, and that note is the whole diagnosis in a case
+    #: where FFmpeg by definition said nothing.
+    "stalled",
+)
+
+
+def _is_fault_line(line: str) -> bool:
+    lowered = line.lower()
+    return any(hint in lowered for hint in FAULT_HINTS)
+
+
+def summarize_ffmpeg_error(lines: Iterable[str], returncode: int | None = None) -> str:
+    """The part of FFmpeg's output that says what went wrong.
+
+    Reporting the trailing lines produced an accurate account of a successful
+    read attached to a failure: a stream listing, a `copy` mapping, and no
+    mention of the fault, because the sentence naming it had already scrolled
+    past. This searches the whole retained window for the diagnosis instead of
+    trusting position.
+
+    When FFmpeg genuinely said nothing diagnostic, that is reported as the
+    finding rather than papered over: the exit code is then the only evidence
+    there is, and it was previously dropped altogether on the repack path.
+    """
+    kept = [line.strip() for line in lines if line.strip()]
+    faults = [line for line in kept if _is_fault_line(line)]
+    if faults:
+        return "\n".join(faults[-FFMPEG_ERROR_REPORT_LINES:])
+
+    code = f" (exit code {returncode})" if returncode is not None else ""
+    if not kept:
+        return f"ffmpeg produced no output at all{code}"
+    tail = "\n".join(kept[-FFMPEG_ERROR_REPORT_LINES:])
+    return f"ffmpeg reported no error text{code}; its last output was:\n{tail}"
 
 
 def _safe_name(raw: str) -> str:
@@ -338,8 +408,8 @@ def _run_ffmpeg_captured(cmd: list[str]) -> tuple[int, str]:
     stderr = proc.stderr or ""
     if stderr:
         print(stderr, end="" if stderr.endswith("\n") else "\n")
-    tail = "\n".join(stderr.strip().splitlines()[-FFMPEG_STDERR_TAIL_LINES:])
-    return proc.returncode, tail
+    summary = summarize_ffmpeg_error(stderr.splitlines(), proc.returncode)
+    return proc.returncode, summary
 
 
 def _preferred_base(
