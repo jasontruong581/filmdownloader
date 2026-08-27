@@ -7,12 +7,19 @@ explained, and is cancellable.
 Cancellation writes to a `.part` file and renames only on success. On Windows a
 terminated FFmpeg can briefly hold its output open, so a failed unlink is
 tolerated rather than fatal.
+
+FFmpeg is never trusted to exit on its own. Its output is read on a thread so
+this executor keeps control of its own waiting: a stream that stops delivering
+data leaves FFmpeg blocked on a socket forever, and reading its pipe directly
+meant that hang became the job's hang, with the cancel flag unreachable.
 """
 
 from __future__ import annotations
 
+import queue
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from .download import (
@@ -44,6 +51,17 @@ TERMINATE_GRACE_SECONDS = 5.0
 
 #: How often the reader loop checks the cancel flag while waiting on output.
 CANCEL_POLL_SECONDS = 0.25
+
+#: How long FFmpeg may produce nothing at all before the attempt is abandoned.
+#:
+#: Generous, because opening a playlist and probing it is legitimately quiet for
+#: a while, and a slow-but-live transfer still reports as it muxes. Silence for
+#: this long means the transfer is not slow, it is stopped.
+STALL_TIMEOUT_SECONDS = 120.0
+
+#: Pushed by the reader thread once FFmpeg closes stdout, so the loop can tell
+#: "finished" from "still waiting" without polling the process.
+_STDOUT_CLOSED = object()
 
 
 def _with_progress_flags(cmd: list[str]) -> list[str]:
@@ -129,25 +147,58 @@ class FfmpegExecutor:
         )
         stderr_thread.start()
 
+        lines: queue.Queue = queue.Queue()
+        stdout_thread = threading.Thread(target=_drain_stdout, args=(process, lines), daemon=True)
+        stdout_thread.start()
+
         cancelled = False
+        stalled = False
+        last_output = time.monotonic()
         try:
-            assert process.stdout is not None
-            for line in process.stdout:
+            while True:
+                try:
+                    line = lines.get(timeout=CANCEL_POLL_SECONDS)
+                except queue.Empty:
+                    # The only place cancellation and a stall can be noticed:
+                    # FFmpeg says nothing in either case.
+                    if cancel.is_set():
+                        cancelled = True
+                        break
+                    if time.monotonic() - last_output >= STALL_TIMEOUT_SECONDS:
+                        stalled = True
+                        break
+                    continue
+
+                if line is _STDOUT_CLOSED:
+                    break
                 if cancel.is_set():
                     cancelled = True
                     break
+
+                # Any line proves FFmpeg is alive, whether or not it parses.
+                last_output = time.monotonic()
                 sample = parser.feed(line)
                 if sample is not None:
                     on_event(progress_event(folder.fold(sample)))
         finally:
-            if cancelled or cancel.is_set():
+            if cancelled or stalled or cancel.is_set():
                 _stop(process)
             returncode = process.wait()
             stderr_thread.join(timeout=2.0)
+            stdout_thread.join(timeout=2.0)
 
         if cancelled or cancel.is_set():
             _discard(part_file)
             raise DownloadCancelled("cancelled before completion")
+
+        if stalled:
+            # Said before FFmpeg's own tail, because FFmpeg reports nothing at
+            # all about this: the last thing it printed was a normal line, and
+            # the exit code only records that it was terminated.
+            stderr_tail.append(
+                f"stalled: no output for {int(STALL_TIMEOUT_SECONDS)}s, "
+                "so the transfer was abandoned"
+            )
 
         if returncode != 0:
             _discard(part_file)
@@ -217,6 +268,20 @@ class FfmpegExecutor:
         on_event(progress_event(Progress(phase=PHASE_DOWNLOADING, percent=100.0)))
         on_event(PipelineEvent(DOWNLOAD_COMPLETED, {"path": str(out)}))
         return out
+
+
+def _drain_stdout(process: subprocess.Popen, lines: queue.Queue) -> None:
+    """Move FFmpeg's progress stream onto a queue the caller can poll.
+
+    The sentinel is pushed from `finally` so a reader that dies still releases
+    the loop, rather than leaving it to time out as a stall it is not.
+    """
+    try:
+        if process.stdout is not None:
+            for line in process.stdout:
+                lines.put(line)
+    finally:
+        lines.put(_STDOUT_CLOSED)
 
 
 def _drain_stderr(process: subprocess.Popen, tail: list[str]) -> None:
