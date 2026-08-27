@@ -10,7 +10,7 @@ import webbrowser
 from .app import create_app, openapi_json
 from .security import InsecureConfiguration
 from ..core.env import load_env_file
-from ..logs import ENV_LOG_LEVEL, configure_logging
+from ..logs import ENV_LOG_LEVEL, configure_console_encoding, configure_logging
 from .settings import load_settings
 
 
@@ -37,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     # Before anything reads a setting or a path, so the documented `.env` file
     # actually reaches them. Real environment variables still win.
     load_env_file()
+    # Before the first print, for the reason the CLI does it: a title from
+    # the page being downloaded is not encodable in a Windows codepage.
+    configure_console_encoding()
     args = build_parser().parse_args(argv)
 
     if args.dump_openapi:

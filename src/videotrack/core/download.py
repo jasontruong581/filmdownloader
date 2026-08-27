@@ -21,7 +21,7 @@ import requests
 
 from .executor import DownloadCancelled
 from .models import CaptureResult, PageMetadata, StreamCandidate
-from .preflight import resolve_tool
+from .preflight import TEXT_OUTPUT, resolve_tool
 
 #: How much of FFmpeg stderr to hold on to while an attempt runs.
 #:
@@ -190,7 +190,7 @@ def hls_strictness_flags(ffmpeg_location: str | None = None) -> tuple[str, ...]:
         result = subprocess.run(
             [binary, "-hide_banner", "-h", "demuxer=hls"],
             capture_output=True,
-            text=True,
+            **TEXT_OUTPUT,
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
@@ -239,7 +239,7 @@ def network_resilience_flags(ffmpeg_location: str | None = None) -> tuple[str, .
         result = subprocess.run(
             [binary, "-hide_banner", "-h", "protocol=http"],
             capture_output=True,
-            text=True,
+            **TEXT_OUTPUT,
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
@@ -331,8 +331,14 @@ def build_ffmpeg_command(
     out_file: Path,
     ffmpeg_location: str | None = None,
 ) -> list[str]:
+    # Resolved here rather than by the caller. The job executor fixed up argv[0]
+    # after building, so the server ran the configured binary while every other
+    # caller - the CLI, and the pipeline it shares - ran a bare name that only
+    # works when FFmpeg happens to be on PATH. Doing it once, where the command
+    # is built, is what makes that impossible to get wrong again.
+    location = Path(ffmpeg_location).expanduser() if ffmpeg_location else None
     cmd = [
-        "ffmpeg",
+        resolve_tool("ffmpeg", location) or "ffmpeg",
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -393,7 +399,7 @@ def _run_command(cmd: list[str]) -> int:
     it is translated into a message that names the tool.
     """
     try:
-        return subprocess.run(cmd, capture_output=False, text=True).returncode
+        return subprocess.run(cmd, capture_output=False, **TEXT_OUTPUT).returncode
     except FileNotFoundError as exc:
         raise ToolNotFound(f"{cmd[0]} not found. Install it or set its location in settings.") from exc
 
@@ -401,7 +407,7 @@ def _run_command(cmd: list[str]) -> int:
 def _run_ffmpeg_captured(cmd: list[str]) -> tuple[int, str]:
     """Run FFmpeg, keeping the tail of stderr so a failure can be explained."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, **TEXT_OUTPUT)
     except FileNotFoundError as exc:
         raise ToolNotFound(f"{cmd[0]} not found. Install it or set its location in settings.") from exc
 

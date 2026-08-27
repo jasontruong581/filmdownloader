@@ -228,6 +228,192 @@ class _TalkingProcess:
         self.terminate()
 
 
+class _ChatteringProcess:
+    """FFmpeg reporting steadily while delivering nothing.
+
+    What a reconnecting FFmpeg does to a stream the far end has dropped: it
+    retries, reports, retries, and the output file never grows. Observed running
+    nineteen minutes at a constant byte count, logging "downloading" throughout.
+    """
+
+    instances: list["_ChatteringProcess"] = []
+
+    def __init__(self, cmd, *args, **kwargs) -> None:
+        self.cmd = cmd
+        self.terminated = False
+        self.returncode = None
+        self.stdout = self._lines()
+        self.stderr = iter(())
+        type(self).instances.append(self)
+
+    def _lines(self):
+        # Never writes the part file: that is the whole point.
+        while not self.terminated:
+            time.sleep(0.01)
+            yield "out_time_ms=1000\n"
+            yield "progress=continue\n"
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 1
+        return 1
+
+    def poll(self) -> int | None:
+        return 1 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+class _AdvancingProcess:
+    """FFmpeg reporting and actually writing - a transfer that is working."""
+
+    instances: list["_AdvancingProcess"] = []
+
+    def __init__(self, cmd, *args, **kwargs) -> None:
+        self.cmd = cmd
+        self.part = Path(cmd[-1])
+        self.terminated = False
+        self.returncode = 0
+        self.stdout = self._lines()
+        self.stderr = iter(())
+        type(self).instances.append(self)
+
+    def _lines(self):
+        for index in range(8):
+            time.sleep(0.05)
+            with self.part.open("ab") as handle:
+                handle.write(b"media" * 200)
+            yield f"out_time_ms={index * 1000}\n"
+            yield "progress=continue\n"
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def poll(self) -> int:
+        return 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+class ChatterIsNotProgressTests(unittest.TestCase):
+    """The regression: liveness was read off FFmpeg output rather than bytes."""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.out_file = Path(self._temp.name) / "Clip.mp4"
+
+        _ChatteringProcess.instances = []
+        _AdvancingProcess.instances = []
+
+        for name in ("hls_strictness_flags", "network_resilience_flags"):
+            flags_patch = patch.object(download_module, name, return_value=())
+            flags_patch.start()
+            self.addCleanup(flags_patch.stop)
+
+        for name, value in (("STALL_TIMEOUT_SECONDS", 0.3), ("CANCEL_POLL_SECONDS", 0.02)):
+            constant = patch.object(executor_module, name, value)
+            constant.start()
+            self.addCleanup(constant.stop)
+
+    def _request(self, candidate: StreamCandidate) -> DownloadRequest:
+        return DownloadRequest(out_file=self.out_file, capture=_capture(), candidate=candidate)
+
+    def test_reporting_without_delivering_is_abandoned(self) -> None:
+        with patch.object(executor_module.subprocess, "Popen", _ChatteringProcess):
+            with self.assertRaises(RuntimeError) as caught:
+                FfmpegExecutor().run(
+                    self._request(_candidate()), threading.Event(), lambda event: None
+                )
+
+        self.assertIn("stalled", str(caught.exception))
+
+    def test_the_chattering_process_is_stopped(self) -> None:
+        with patch.object(executor_module.subprocess, "Popen", _ChatteringProcess):
+            with self.assertRaises(RuntimeError):
+                FfmpegExecutor().run(
+                    self._request(_candidate()), threading.Event(), lambda event: None
+                )
+
+        self.assertTrue(_ChatteringProcess.instances[0].terminated)
+
+    def test_reporting_while_delivering_is_left_alone(self) -> None:
+        # The other half: the watchdog must not fire on a working transfer just
+        # because it is slower than the timeout is short.
+        with patch.object(executor_module.subprocess, "Popen", _AdvancingProcess):
+            result = FfmpegExecutor().run(
+                self._request(_candidate()), threading.Event(), lambda event: None
+            )
+
+        self.assertEqual(result, self.out_file)
+        self.assertFalse(_AdvancingProcess.instances[0].terminated)
+
+
+class OutputWatchdogTests(unittest.TestCase):
+    """The measure itself, without a process in the way."""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.path = Path(self._temp.name) / "part.mp4"
+
+        for name, value in (("STALL_TIMEOUT_SECONDS", 0.2), ("CANCEL_POLL_SECONDS", 0.0)):
+            constant = patch.object(executor_module, name, value)
+            constant.start()
+            self.addCleanup(constant.stop)
+
+    def test_a_growing_file_never_stalls(self) -> None:
+        self.path.write_bytes(b"a")
+        watchdog = executor_module._OutputWatchdog(self.path)
+
+        for size in range(2, 8):
+            time.sleep(0.05)
+            self.path.write_bytes(b"a" * size)
+            self.assertFalse(watchdog.stalled())
+
+    def test_a_frozen_file_stalls_once_the_window_passes(self) -> None:
+        self.path.write_bytes(b"a")
+        watchdog = executor_module._OutputWatchdog(self.path)
+
+        self.assertFalse(watchdog.stalled())
+        time.sleep(0.25)
+        self.assertTrue(watchdog.stalled())
+
+    def test_a_missing_file_is_treated_as_no_bytes(self) -> None:
+        # The part file does not exist until FFmpeg opens it, which must not
+        # read as an error and must not read as progress either.
+        watchdog = executor_module._OutputWatchdog(self.path)
+
+        self.assertFalse(watchdog.stalled())
+        time.sleep(0.25)
+        self.assertTrue(watchdog.stalled())
+
+    def test_the_first_sample_is_never_throttled_away(self) -> None:
+        # A zero sentinel for "not yet sampled" compared against a monotonic
+        # clock behaves differently on a fresh boot than on a long uptime; this
+        # pins the behaviour that must not depend on it.
+        with patch.object(executor_module, "CANCEL_POLL_SECONDS", 3600.0):
+            self.path.write_bytes(b"a")
+            watchdog = executor_module._OutputWatchdog(self.path)
+
+            # The first call samples despite a throttle window far longer than
+            # any run, and records having done so.
+            self.assertFalse(watchdog.stalled())
+            first = watchdog._sampled_at
+            self.assertIsNotNone(first)
+
+            # The second is inside the window, so it answers without sampling.
+            self.assertFalse(watchdog.stalled())
+            self.assertEqual(watchdog._sampled_at, first)
+
+
 class StallWatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = TemporaryDirectory()
@@ -283,8 +469,12 @@ class StallWatchdogTests(unittest.TestCase):
                     self._request(_candidate()), threading.Event(), self._record
                 )
 
-        # FFmpeg reports nothing about this itself, so the executor has to.
-        self.assertIn("no output for", str(caught.exception))
+        # FFmpeg reports nothing about this itself, so the executor has to, and
+        # it has to name what it measured: bytes written, not lines printed. A
+        # reconnecting FFmpeg prints throughout a transfer that has stopped.
+        message = str(caught.exception)
+        self.assertIn("no data written", message)
+        self.assertIn(str(int(executor_module.STALL_TIMEOUT_SECONDS)), message)
 
     def test_cancel_takes_effect_while_ffmpeg_is_silent(self) -> None:
         # The regression: the cancel check sat inside the loop over stdout, so a

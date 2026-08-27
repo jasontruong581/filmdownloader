@@ -15,6 +15,19 @@ from pathlib import Path
 
 ENV_FFMPEG = "FILMDOWNLOADER_FFMPEG"
 
+#: How to decode an external tool's output.
+#:
+#: `text=True` alone decodes with the locale codec, which on a Windows console
+#: is an ANSI codepage. FFmpeg writes bytes that are not valid there - a stream
+#: title, a codec tag, a URL from a foreign-language page - and the decoder
+#: raises rather than substituting. That killed the thread reading FFmpeg
+#: stderr outright, so a failed download arrived with no diagnosis at all: the
+#: reader had died before the reason was printed.
+#:
+#: `errors="replace"` is deliberate. A mangled character in a diagnostic is a
+#: cosmetic problem; an exception in a reader thread destroys the diagnostic.
+TEXT_OUTPUT: dict[str, object] = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
 #: Tool name -> whether the pipeline can run at all without it.
 TOOLS: tuple[tuple[str, bool], ...] = (
     ("ffmpeg", True),
@@ -66,7 +79,7 @@ def _tool_version(path: str, name: str) -> str | None:
         result = subprocess.run(
             [path, _VERSION_FLAG.get(name, "-version")],
             capture_output=True,
-            text=True,
+            **TEXT_OUTPUT,
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
