@@ -115,6 +115,26 @@ def load_settings() -> Settings:
     return settings
 
 
+def publish_ffmpeg_location(settings: Settings) -> None:
+    """Put the effective FFmpeg location where a caller without a job can read it.
+
+    Not everything that needs FFmpeg has a download request in scope: probing a
+    candidate for its duration and a site plugin converting an asset both call
+    `resolve_tool` with no location, which falls back to this variable. Only the
+    settings file knew the answer, and it never reached that fallback, so an
+    operator who configured FFmpeg in Settings alone had one half of the
+    pipeline find it and the other half report it missing.
+
+    An empty setting clears the variable rather than leaving a stale value,
+    which `load_settings` would otherwise fold straight back in.
+    """
+    raw = settings.ffmpeg_location.strip()
+    if raw:
+        os.environ[ENV_FFMPEG] = raw
+    else:
+        os.environ.pop(ENV_FFMPEG, None)
+
+
 def save_settings(settings: Settings, path: Path | str | None = None) -> Settings:
     """Persist settings, by default to the state directory.
 

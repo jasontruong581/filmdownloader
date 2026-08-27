@@ -449,6 +449,7 @@ def download_obfuscated_hls(
     out_file: Path,
     cancel: threading.Event | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    ffmpeg_location: str | None = None,
 ) -> Path:
     """Repack an HLS stream FFmpeg cannot read, segment by segment.
 
@@ -497,8 +498,14 @@ def download_obfuscated_hls(
             elif idx % 50 == 0 or idx == total:
                 print(f"[i] Repacked segments: {idx}/{total}")
 
+    # Resolved rather than named: FFmpeg is regularly configured in Settings
+    # only, never placed on PATH, and this step used to ask for a bare `ffmpeg`.
+    # Every segment would download, and the repack then failed at the last
+    # moment claiming FFmpeg was not installed - by the same FFmpeg that had
+    # already run the attempt this fallback exists to rescue.
+    location = Path(ffmpeg_location).expanduser() if ffmpeg_location else None
     remux_cmd = [
-        "ffmpeg",
+        resolve_tool("ffmpeg", location) or "ffmpeg",
         "-y",
         "-hide_banner",
         "-loglevel",
