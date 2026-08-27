@@ -23,11 +23,13 @@ import time
 from pathlib import Path
 
 from .download import (
+    FFMPEG_STDERR_KEEP_LINES,
     ToolNotFound,
     build_ffmpeg_command,
     download_obfuscated_hls,
     is_hls_candidate,
     postprocess_candidate,
+    summarize_ffmpeg_error,
 )
 from .events import (
     DOWNLOAD_COMPLETED,
@@ -44,7 +46,9 @@ from .executor import DownloadCancelled, DownloadRequest
 from .ffmpeg_progress import FfmpegProgressParser
 from .preflight import resolve_tool
 
-STDERR_TAIL_LINES = 12
+#: Where the diagnosis is searched for, rather than where it is assumed to be.
+#: Owned by `download` so the two places that read FFmpeg stderr agree.
+STDERR_TAIL_LINES = FFMPEG_STDERR_KEEP_LINES
 
 #: Seconds to wait after terminate() before killing.
 TERMINATE_GRACE_SECONDS = 5.0
@@ -202,14 +206,14 @@ class FfmpegExecutor:
 
         if returncode != 0:
             _discard(part_file)
-            detail = "\n".join(stderr_tail[-STDERR_TAIL_LINES:]).strip()
+            detail = summarize_ffmpeg_error(stderr_tail, returncode)
             if is_hls_candidate(request.candidate):
                 # FFmpeg refuses plenty of real playlists: segments served with
                 # no usable extension, a MIME type that is not RFC 8216
                 # compliant, or a payload wrapped behind another format's
                 # header. Fetching the segments directly is the only thing that
                 # reads those, so a failure here is not the end of the attempt.
-                return self._repack(request, cancel, on_event, detail)
+                return self._repack(request, cancel, on_event, detail, returncode)
             on_event(PipelineEvent(FAILED, {"reason": "ffmpeg_failed", "error": detail}))
             raise RuntimeError(
                 f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
@@ -231,6 +235,7 @@ class FfmpegExecutor:
         cancel: threading.Event,
         on_event: EventSink,
         ffmpeg_detail: str,
+        ffmpeg_returncode: int,
     ) -> Path:
         """Fetch the playlist segments directly when FFmpeg would not read them.
 
@@ -262,7 +267,15 @@ class FfmpegExecutor:
         except DownloadCancelled:
             raise
         except Exception as exc:  # noqa: BLE001
-            error = f"ffmpeg refused it ({ffmpeg_detail or 'no detail'}) and the repack failed: {exc}"
+            # The repack failing is what ends the attempt, so it leads. What
+            # FFmpeg said is context, and the exit code belongs with it: it was
+            # dropped here entirely, which left this path unable to say anything
+            # at all about why the direct attempt was abandoned.
+            error = (
+                f"the repack failed: {exc}"
+                f" (ffmpeg had already exited {ffmpeg_returncode}: "
+                f"{ffmpeg_detail or 'no detail'})"
+            )
             on_event(PipelineEvent(FAILED, {"reason": "repack_failed", "error": error}))
             raise RuntimeError(error) from exc
 
