@@ -129,6 +129,65 @@ def hls_strictness_flags(ffmpeg_location: str | None = None) -> tuple[str, ...]:
     return ("-extension_picky", "0") if "extension_picky" in help_text else ()
 
 
+#: How long to keep retrying a dropped connection before giving up. FFmpeg
+#: defaults to 120, which spends two minutes on a stream that is already gone.
+RECONNECT_DELAY_MAX_SECONDS = 30
+
+#: Reconnect on transient server faults only. A 4xx is a verdict, not a hiccup:
+#: an expired token answers 403 forever, and retrying it would rebuild the very
+#: hang these flags exist to remove.
+RECONNECT_HTTP_STATUS = "5xx"
+
+#: Every option is an input option and has to precede `-i`.
+_RESILIENCE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("reconnect", "1"),
+    ("reconnect_streamed", "1"),
+    ("reconnect_on_network_error", "1"),
+    ("reconnect_delay_max", str(RECONNECT_DELAY_MAX_SECONDS)),
+    ("reconnect_on_http_error", RECONNECT_HTTP_STATUS),
+)
+
+
+@lru_cache(maxsize=8)
+def network_resilience_flags(ffmpeg_location: str | None = None) -> tuple[str, ...]:
+    """Flags that make FFmpeg survive a connection the far end drops.
+
+    Every reconnect option ships off by default, so an interrupted transfer left
+    FFmpeg blocked on a socket the server had already closed - observed as a
+    download that sat at the same byte count for hours with its sockets in
+    CLOSE_WAIT, never erroring and never exiting. The HTTP protocol offers no
+    read timeout to catch that, which leaves reconnection as the only way the
+    process notices.
+
+    Probed against the same binary the command will run, for the reason
+    `hls_strictness_flags` documents: an option this build does not have makes
+    it exit before downloading anything.
+    """
+    location = Path(ffmpeg_location).expanduser() if ffmpeg_location else None
+    binary = resolve_tool("ffmpeg", location) or "ffmpeg"
+    try:
+        result = subprocess.run(
+            [binary, "-hide_banner", "-h", "protocol=http"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    help_text = (result.stdout or "") + (result.stderr or "")
+
+    flags: list[str] = []
+    for name, value in _RESILIENCE_OPTIONS:
+        if f"-{name}" in help_text:
+            flags.extend([f"-{name}", value])
+    return tuple(flags)
+
+
+def is_network_candidate(candidate: StreamCandidate) -> bool:
+    """Whether this input is fetched over HTTP, and so can stall mid-transfer."""
+    return candidate.url.lower().startswith(("http://", "https://"))
+
+
 def fetch_page_metadata(capture: CaptureResult, page_html: str | None = None) -> PageMetadata:
     """Descriptive fields from whichever site plugin claims this page."""
     plugin = _site_plugin_for(capture.final_url or capture.page_url)
@@ -216,6 +275,11 @@ def build_ffmpeg_command(
     headers = _headers_block(capture, candidate.referer)
     if headers:
         cmd.extend(["-headers", headers])
+
+    if is_network_candidate(candidate):
+        # Not restricted to playlists: a single file served over HTTP stalls the
+        # same way, and has the same nothing to fall back on.
+        cmd.extend(network_resilience_flags(ffmpeg_location))
 
     if is_hls_candidate(candidate):
         cmd.extend(

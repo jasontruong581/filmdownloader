@@ -136,12 +136,13 @@ class ExecutorFallbackTests(unittest.TestCase):
         self.out_file = Path(self._temp.name) / "Clip.mp4"
         self.events: list[PipelineEvent] = []
 
-        # The strictness probe shells out, and these tests replace Popen, which
-        # subprocess.run uses as a context manager. Pinning it keeps the built
+        # Both capability probes shell out, and these tests replace Popen, which
+        # subprocess.run uses as a context manager. Pinning them keeps the built
         # command independent of whichever FFmpeg the machine has anyway.
-        flags_patch = patch.object(download_module, "hls_strictness_flags", return_value=())
-        flags_patch.start()
-        self.addCleanup(flags_patch.stop)
+        for name in ("hls_strictness_flags", "network_resilience_flags"):
+            flags_patch = patch.object(download_module, name, return_value=())
+            flags_patch.start()
+            self.addCleanup(flags_patch.stop)
 
     def _request(self, candidate: StreamCandidate) -> DownloadRequest:
         return DownloadRequest(out_file=self.out_file, capture=_capture(), candidate=candidate)
