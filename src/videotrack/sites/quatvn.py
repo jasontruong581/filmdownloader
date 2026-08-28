@@ -12,6 +12,7 @@ import requests
 
 from ..core.capture import _build_driver, _try_play_in_current_context, selenium_api
 from ..core.download import _request_headers, _run_command, _safe_name
+from ..core.preflight import TEXT_OUTPUT
 from ..core.models import CaptureResult, CrawlPreset, StreamCandidate
 from ..core.paths import ensure_scratch_dir
 from . import BaseSitePlugin, register
@@ -445,7 +446,7 @@ def _frame_delays(temp_in: Path) -> list[float]:
     identify = subprocess.run(
         ["magick", "identify", "-format", "%T\n", str(temp_in)],
         capture_output=True,
-        text=True,
+        **TEXT_OUTPUT,
     )
     if identify.returncode != 0:
         raise RuntimeError("magick failed to read quatvn webp frame delays")

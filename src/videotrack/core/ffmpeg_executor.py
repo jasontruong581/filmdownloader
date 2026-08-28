@@ -44,7 +44,7 @@ from .events import (
 )
 from .executor import DownloadCancelled, DownloadRequest
 from .ffmpeg_progress import FfmpegProgressParser
-from .preflight import resolve_tool
+from .preflight import TEXT_OUTPUT, resolve_tool
 
 #: Where the diagnosis is searched for, rather than where it is assumed to be.
 #: Owned by `download` so the two places that read FFmpeg stderr agree.
@@ -56,16 +56,63 @@ TERMINATE_GRACE_SECONDS = 5.0
 #: How often the reader loop checks the cancel flag while waiting on output.
 CANCEL_POLL_SECONDS = 0.25
 
-#: How long FFmpeg may produce nothing at all before the attempt is abandoned.
+#: How long the output file may fail to grow before the attempt is abandoned.
 #:
-#: Generous, because opening a playlist and probing it is legitimately quiet for
-#: a while, and a slow-but-live transfer still reports as it muxes. Silence for
-#: this long means the transfer is not slow, it is stopped.
+#: Generous, because opening a playlist and probing it legitimately writes
+#: nothing for a while. Measured on bytes rather than on FFmpeg reporting: a
+#: reconnecting FFmpeg reports forever, so chatter proves the process is alive
+#: and says nothing about whether the transfer is.
 STALL_TIMEOUT_SECONDS = 120.0
 
 #: Pushed by the reader thread once FFmpeg closes stdout, so the loop can tell
 #: "finished" from "still waiting" without polling the process.
 _STDOUT_CLOSED = object()
+
+
+def _size_of(path: Path) -> int:
+    """Bytes on disk, treating an absent or unreadable file as none."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+class _OutputWatchdog:
+    """Whether the transfer has stopped advancing, measured on the output file.
+
+    Liveness used to be measured on FFmpeg's own chatter, which is not the same
+    question. Asked to reconnect on a dropped stream, FFmpeg retries and reports
+    indefinitely: the process is busy, the log is moving, and no bytes are
+    arriving. A transfer was watched sitting at the same byte count for nineteen
+    minutes while it announced "downloading" the whole time.
+
+    Only the size of the file being written separates working from failing, so
+    that is what this measures.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._size = _size_of(path)
+        self._advanced_at = time.monotonic()
+        #: None means "not yet sampled", which must always sample. A zero
+        #: compared against a monotonic clock reads as a very old sample on a
+        #: long-running machine and a very recent one just after boot.
+        self._sampled_at: float | None = None
+
+    def stalled(self) -> bool:
+        now = time.monotonic()
+        if self._sampled_at is not None and now - self._sampled_at < CANCEL_POLL_SECONDS:
+            # FFmpeg reports several times a second; a stat() per report would
+            # be many calls to answer a question about a two-minute window.
+            return False
+        self._sampled_at = now
+
+        size = _size_of(self._path)
+        if size > self._size:
+            self._size = size
+            self._advanced_at = now
+            return False
+        return now - self._advanced_at >= STALL_TIMEOUT_SECONDS
 
 
 def _with_progress_flags(cmd: list[str]) -> list[str]:
@@ -137,7 +184,7 @@ class FfmpegExecutor:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                **TEXT_OUTPUT,
                 bufsize=1,
             )
         except FileNotFoundError as exc:
@@ -157,18 +204,16 @@ class FfmpegExecutor:
 
         cancelled = False
         stalled = False
-        last_output = time.monotonic()
+        watchdog = _OutputWatchdog(part_file)
         try:
             while True:
                 try:
                     line = lines.get(timeout=CANCEL_POLL_SECONDS)
                 except queue.Empty:
-                    # The only place cancellation and a stall can be noticed:
-                    # FFmpeg says nothing in either case.
                     if cancel.is_set():
                         cancelled = True
                         break
-                    if time.monotonic() - last_output >= STALL_TIMEOUT_SECONDS:
+                    if watchdog.stalled():
                         stalled = True
                         break
                     continue
@@ -179,8 +224,15 @@ class FfmpegExecutor:
                     cancelled = True
                     break
 
-                # Any line proves FFmpeg is alive, whether or not it parses.
-                last_output = time.monotonic()
+                # Checked on this branch too, and not only while FFmpeg is
+                # quiet. Reconnecting on a dropped stream makes it retry and
+                # report indefinitely, so a loop that treated any line as a
+                # sign of life watched a transfer sit at the same byte count
+                # for nineteen minutes while it said "downloading" throughout.
+                if watchdog.stalled():
+                    stalled = True
+                    break
+
                 sample = parser.feed(line)
                 if sample is not None:
                     on_event(progress_event(folder.fold(sample)))
@@ -200,7 +252,7 @@ class FfmpegExecutor:
             # all about this: the last thing it printed was a normal line, and
             # the exit code only records that it was terminated.
             stderr_tail.append(
-                f"stalled: no output for {int(STALL_TIMEOUT_SECONDS)}s, "
+                f"stalled: no data written for {int(STALL_TIMEOUT_SECONDS)}s, "
                 "so the transfer was abandoned"
             )
 

@@ -37,6 +37,7 @@ from .events import (
     EventSink,
     PipelineEvent,
 )
+from .preflight import TEXT_OUTPUT
 from .models import CaptureResult, StreamCandidate
 from .options import PipelineOptions
 
@@ -180,7 +181,7 @@ def probe_duration_seconds(path: Path) -> float | None:
         str(path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, check=True, **TEXT_OUTPUT)
         data = json.loads(result.stdout or "{}")
         duration = float(data.get("format", {}).get("duration", 0))
         return duration if duration > 0 else None
@@ -214,7 +215,7 @@ def probe_candidate_media(capture: CaptureResult, candidate: StreamCandidate) ->
     cmd.extend(["-show_entries", "format=duration,bit_rate", "-of", "json", candidate.url])
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, check=True, **TEXT_OUTPUT)
         data = json.loads(result.stdout or "{}")
         fmt = data.get("format", {})
         duration = float(fmt.get("duration", 0) or 0)

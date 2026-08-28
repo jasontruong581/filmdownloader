@@ -11,7 +11,9 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from videotrack.core import download as download_module
 from videotrack.core.download import _headers_block, build_ffmpeg_command
 from videotrack.core.ffmpeg_executor import _resolved_binary
 from videotrack.core.models import CaptureResult, StreamCandidate
@@ -58,6 +60,14 @@ class HeaderBlockTests(unittest.TestCase):
 
 
 class CommandShapeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # argv[0] is resolved when the command is built, so the shape asserted
+        # below would otherwise depend on whether this machine has FFmpeg on
+        # PATH or a location in the environment.
+        resolver = patch.object(download_module, "resolve_tool", return_value=None)
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
     def test_command_starts_with_the_fixed_prefix(self) -> None:
         cmd = build_ffmpeg_command(_capture(), _candidate(), OUT)
 

@@ -48,6 +48,32 @@ def _from_env() -> str:
     return os.environ.get(ENV_LOG_LEVEL, "")
 
 
+def configure_console_encoding() -> None:
+    """Make the console able to write the text the pipeline handles.
+
+    Titles come from the pages being downloaded, so non-ASCII is the normal case
+    rather than an edge case. A Windows console encodes with an ANSI codepage by
+    default, where a Vietnamese title raises `UnicodeEncodeError` - and printing
+    the title, not downloading anything, is what then ended the command.
+
+    `errors="replace"` for the same reason the tool-output policy uses it: a
+    mangled glyph costs a character, an exception costs the whole run.
+
+    Both streams, because progress records go to stderr and results to stdout,
+    and either can carry a title.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            # A captured or replaced stream - a test harness, a pipe wrapper -
+            # need not support this, and must not be a reason to fail.
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def configure_logging(level: str | None = None) -> str:
     """Send `videotrack` records to stderr at the resolved level.
 

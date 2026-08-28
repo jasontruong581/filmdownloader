@@ -25,7 +25,7 @@ from .core.pipeline import (
 )
 from .core.pipeline import run as pipeline_run
 from .core.env import load_env_file
-from .logs import configure_logging
+from .logs import configure_console_encoding, configure_logging
 from .core.preflight import ENV_FFMPEG, check_tools, ffmpeg_location, format_report
 from .engines import ytdlp_version
 from .engines.batch import probe as batch_probe, sample_verify
@@ -720,6 +720,9 @@ def main(argv: list[str] | None = None) -> int:
     # Before the parser builds its defaults from the paths module, so the
     # documented `.env` file actually reaches them.
     load_env_file()
+    # Before the first print. A page title is the earliest non-ASCII text the
+    # command handles, and on a Windows console it was fatal to print one.
+    configure_console_encoding()
     # Progress records go to stderr, so stdout stays usable as data for the
     # commands whose output is meant to be piped.
     configure_logging()
