@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..core.options import PipelineOptions
 from ..core.paths import state_dir
+from ..engines.browser_resolver import BrowserOptions
 from ..engines.chain import ChainOptions
 from ..engines.ytdlp_resolver import YtDlpOptions
 from ..hosts import DEFAULT_HOST_BONUSES
@@ -73,6 +74,7 @@ class ServerState:
             output_dir=settings.resolved_output_dir,
             host_bonuses=DEFAULT_HOST_BONUSES,
             ffmpeg_location=settings.ffmpeg_location or None,
+            chrome_profile=settings.chrome_profile or None,
         )
 
     def chain_options(self, engines: list[str] | None = None) -> ChainOptions:
@@ -80,6 +82,7 @@ class ServerState:
         return ChainOptions(
             engines=order,
             ytdlp=YtDlpOptions(cookies_from_browser=self.settings.cookies_from_browser or None),
+            browser=BrowserOptions(chrome_profile=self.settings.chrome_profile or None),
         )
 
     def apply_settings(self, settings: Settings) -> Settings:

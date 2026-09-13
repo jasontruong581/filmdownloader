@@ -52,6 +52,18 @@ def _add_shared_capture_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("url", help="Video page URL that you are authorized to analyze/download")
     parser.add_argument("--wait", type=int, default=15, help="Seconds to wait for network traffic")
     parser.add_argument("--headed", action="store_true", help="Run Chrome with UI (default is headless)")
+    _add_chrome_profile_flag(parser)
+
+
+def _add_chrome_profile_flag(parser: argparse.ArgumentParser) -> None:
+    """Every command that starts Chrome takes it.
+
+    A page behind a login is captured with the operator's own session or not at
+    all, and the cookies the capture collects are what reach FFmpeg - so a
+    command that can capture but cannot be told which profile to capture with
+    simply cannot download those pages.
+    """
+    parser.add_argument("--chrome-profile", default="", help="Capture with an existing Chrome profile: the user-data directory, or one profile inside it. Chrome must not already be running with it.")
 
 
 def _add_autonomous_flag(parser: argparse.ArgumentParser) -> None:
@@ -141,6 +153,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         url=args.url,
         wait_seconds=args.wait,
         headless=not args.headed,
+        chrome_profile=getattr(args, "chrome_profile", "") or None,
     )
     save_capture(capture, Path(args.capture_out))
     print(f"[+] Saved capture: {args.capture_out}")
@@ -330,6 +343,7 @@ def _chain_options(args: argparse.Namespace) -> ChainOptions:
         browser=BrowserOptions(
             wait_seconds=getattr(args, "wait", 15),
             headless=not getattr(args, "headed", False),
+            chrome_profile=getattr(args, "chrome_profile", "") or None,
         ),
     )
 
@@ -560,6 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_detect.add_argument("--wait", type=int, default=15, help="Seconds to wait when deep-scanning embed URLs")
     p_detect.add_argument("--extra-wait", type=int, default=45, help="Extra seconds for second deep-scan pass")
     p_detect.add_argument("--headed", action="store_true", help="Run Chrome with UI during deep-scan")
+    _add_chrome_profile_flag(p_detect)
     p_detect.add_argument("--no-probe", action="store_true", help="Skip HTTP probe for candidate validation")
     p_detect.add_argument("--allow-host", action="append", default=[], help="Allow only candidates from this host (repeatable)")
     p_detect.add_argument("--prefer-host", action="append", default=[], help="Boost candidates from this host (repeatable)")
@@ -576,6 +591,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_download.add_argument("--wait", type=int, default=15, help="Seconds to wait when deep-scanning embed URLs")
     p_download.add_argument("--extra-wait", type=int, default=45, help="Extra seconds for second deep-scan pass")
     p_download.add_argument("--headed", action="store_true", help="Run Chrome with UI during deep-scan")
+    _add_chrome_profile_flag(p_download)
     p_download.add_argument("--no-probe", action="store_true")
     _add_autonomous_flag(p_download)
     _add_selection_flags(p_download)
@@ -623,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_formats.add_argument("--engine", action="append", choices=list(engine_choices()), help="Restrict the engine chain (repeatable, in order)")
     p_formats.add_argument("--wait", type=int, default=15, help="Seconds to wait when the browser engine is used")
     p_formats.add_argument("--headed", action="store_true", help="Run Chrome with UI when the browser engine is used")
+    _add_chrome_profile_flag(p_formats)
     p_formats.add_argument("--cookies-from-browser", default="", help="Reuse a browser profile's cookies, e.g. chrome (best effort)")
     p_formats.set_defaults(func=cmd_list_formats)
 

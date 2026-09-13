@@ -5,6 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, NamedTuple
 
 from .models import CaptureResult, NetworkRequest
@@ -47,7 +48,28 @@ def selenium_api() -> SeleniumApi:
     return SeleniumApi(webdriver, Options, By, EC, WebDriverWait)
 
 
-def _build_driver(headless: bool):
+#: What Chrome says when the profile is open in another window. Matched on
+#: the message because the exception type lives in Selenium, which core does
+#: not import.
+PROFILE_IN_USE = "user data directory is already in use"
+
+
+def chrome_profile_arguments(location: str) -> tuple[str, ...]:
+    """Chrome flags that open an existing profile.
+
+    The setting names either the user-data directory or one profile inside it,
+    the two forms an operator actually has to hand: `.../User Data` is what
+    Chrome calls its own path, and `.../User Data/Profile 1` is what a person
+    means by "my second profile". Accepting both is the same courtesy the
+    FFmpeg location setting extends.
+    """
+    path = Path(location).expanduser()
+    if (path / "Local State").is_file() or (path / "Default").is_dir():
+        return (f"--user-data-dir={path}",)
+    return (f"--user-data-dir={path.parent}", f"--profile-directory={path.name}")
+
+
+def _build_driver(headless: bool, chrome_profile: str | None = None):
     api = selenium_api()
     options = api.Options()
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
@@ -56,7 +78,22 @@ def _build_driver(headless: bool):
     options.add_argument("--window-size=1400,900")
     if headless:
         options.add_argument("--headless=new")
-    driver = api.webdriver.Chrome(options=options)
+    if chrome_profile:
+        for argument in chrome_profile_arguments(chrome_profile):
+            options.add_argument(argument)
+
+    try:
+        driver = api.webdriver.Chrome(options=options)
+    except Exception as exc:  # noqa: BLE001 - re-raised either way
+        if chrome_profile and PROFILE_IN_USE in str(exc).lower():
+            # Otherwise this arrives as a wall of Chrome diagnostics that never
+            # mentions the one thing the operator has to do about it.
+            raise RuntimeError(
+                f"Chrome is already running with the profile at {chrome_profile}. "
+                "Close every Chrome window, or copy the profile directory and "
+                "point this at the copy."
+            ) from exc
+        raise
     driver.execute_cdp_cmd("Network.enable", {})
     return driver
 
@@ -110,6 +147,7 @@ def capture_page(
     wait_seconds: int = 15,
     headless: bool = True,
     try_play: bool = True,
+    chrome_profile: str | None = None,
 ) -> CaptureResult:
     started = time.monotonic()
 
@@ -117,7 +155,7 @@ def capture_page(
         return time.monotonic() - started
 
     logger.info("capture: starting Chrome (%s)", "headless" if headless else "headed")
-    driver = _build_driver(headless=headless)
+    driver = _build_driver(headless=headless, chrome_profile=chrome_profile)
     logger.info("capture: Chrome ready in %.1fs", elapsed())
 
     try:
