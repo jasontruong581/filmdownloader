@@ -835,7 +835,7 @@ def _download_playlist_parts(
             raw = _fetch(segment.uri, headers, what)
 
         payload = _extract_png_tail_payload(raw)
-        if index == 1 and not _looks_like_media(segment, playlist, payload):
+        if index == 1 and not _looks_like_media(segment, payload):
             raise RuntimeError("segment payload is not usable media after unwrapping")
 
         name = f"seg{index:05d}.bin"
@@ -850,7 +850,7 @@ def _download_playlist_parts(
     return names
 
 
-def _looks_like_media(segment: hls.Segment, playlist: hls.Playlist, payload: bytes) -> bool:
+def _looks_like_media(segment: hls.Segment, payload: bytes) -> bool:
     """Whether the first segment is recognisable, when it is meant to be.
 
     The check exists to catch a page that served something other than media,
