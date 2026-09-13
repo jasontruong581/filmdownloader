@@ -16,15 +16,19 @@ No FFmpeg and no network here: the capability probe and the process are stubbed.
 
 from __future__ import annotations
 
+import io
+import subprocess
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from videotrack.core import download as download_module
 from videotrack.core import ffmpeg_executor as executor_module
+from videotrack.core import ffmpeg_process as watchdog_module
 from videotrack.core.download import build_ffmpeg_command, network_resilience_flags
 from videotrack.core.events import DOWNLOAD_COMPLETED, PipelineEvent
 from videotrack.core.executor import DownloadCancelled, DownloadRequest
@@ -357,21 +361,27 @@ class ChatterIsNotProgressTests(unittest.TestCase):
 
 
 class OutputWatchdogTests(unittest.TestCase):
-    """The measure itself, without a process in the way."""
+    """The measure itself, without a process in the way.
+
+    Constructed with explicit bounds rather than patched globals: the two
+    callers poll on different schedules, so the schedule is an argument.
+    """
+
+    TIMEOUT = 0.2
 
     def setUp(self) -> None:
         self._temp = TemporaryDirectory()
         self.addCleanup(self._temp.cleanup)
         self.path = Path(self._temp.name) / "part.mp4"
 
-        for name, value in (("STALL_TIMEOUT_SECONDS", 0.2), ("CANCEL_POLL_SECONDS", 0.0)):
-            constant = patch.object(executor_module, name, value)
-            constant.start()
-            self.addCleanup(constant.stop)
+    def _watchdog(self, sample_interval: float = 0.0):
+        return watchdog_module.OutputWatchdog(
+            self.path, timeout=self.TIMEOUT, sample_interval=sample_interval
+        )
 
     def test_a_growing_file_never_stalls(self) -> None:
         self.path.write_bytes(b"a")
-        watchdog = executor_module._OutputWatchdog(self.path)
+        watchdog = self._watchdog()
 
         for size in range(2, 8):
             time.sleep(0.05)
@@ -380,7 +390,7 @@ class OutputWatchdogTests(unittest.TestCase):
 
     def test_a_frozen_file_stalls_once_the_window_passes(self) -> None:
         self.path.write_bytes(b"a")
-        watchdog = executor_module._OutputWatchdog(self.path)
+        watchdog = self._watchdog()
 
         self.assertFalse(watchdog.stalled())
         time.sleep(0.25)
@@ -389,7 +399,7 @@ class OutputWatchdogTests(unittest.TestCase):
     def test_a_missing_file_is_treated_as_no_bytes(self) -> None:
         # The part file does not exist until FFmpeg opens it, which must not
         # read as an error and must not read as progress either.
-        watchdog = executor_module._OutputWatchdog(self.path)
+        watchdog = self._watchdog()
 
         self.assertFalse(watchdog.stalled())
         time.sleep(0.25)
@@ -399,19 +409,26 @@ class OutputWatchdogTests(unittest.TestCase):
         # A zero sentinel for "not yet sampled" compared against a monotonic
         # clock behaves differently on a fresh boot than on a long uptime; this
         # pins the behaviour that must not depend on it.
-        with patch.object(executor_module, "CANCEL_POLL_SECONDS", 3600.0):
-            self.path.write_bytes(b"a")
-            watchdog = executor_module._OutputWatchdog(self.path)
+        self.path.write_bytes(b"a")
+        watchdog = self._watchdog(sample_interval=3600.0)
 
-            # The first call samples despite a throttle window far longer than
-            # any run, and records having done so.
-            self.assertFalse(watchdog.stalled())
-            first = watchdog._sampled_at
-            self.assertIsNotNone(first)
+        # The first call samples despite a throttle window far longer than any
+        # run, and records having done so.
+        self.assertFalse(watchdog.stalled())
+        first = watchdog._sampled_at
+        self.assertIsNotNone(first)
 
-            # The second is inside the window, so it answers without sampling.
-            self.assertFalse(watchdog.stalled())
-            self.assertEqual(watchdog._sampled_at, first)
+        # The second is inside the window, so it answers without sampling.
+        self.assertFalse(watchdog.stalled())
+        self.assertEqual(watchdog._sampled_at, first)
+
+    def test_the_note_names_what_was_measured(self) -> None:
+        # It reaches the user as the whole diagnosis, because FFmpeg by
+        # definition said nothing about being abandoned.
+        note = self._watchdog().note()
+
+        self.assertIn("no data written", note)
+        self.assertIn(str(int(self.TIMEOUT)), note)
 
 
 class StallWatchdogTests(unittest.TestCase):
@@ -550,6 +567,151 @@ class StallWatchdogTests(unittest.TestCase):
 
         self.assertEqual(repack.call_count, 1)
         self.assertEqual(result.read_bytes(), b"repacked")
+
+
+class _ChatteringFfmpeg:
+    """Reports steadily, writes nothing, and never exits on its own.
+
+    A reconnecting FFmpeg on a stream the far end has dropped. `wait()` times
+    out for as long as it is alive, which is what `subprocess.run` used to sit
+    on: the CLI asked FFmpeg when it was finished and FFmpeg never answered.
+    """
+
+    instances: list["_ChatteringFfmpeg"] = []
+
+    def __init__(self, cmd, *args, **kwargs) -> None:
+        self.cmd = cmd
+        self.terminated = False
+        self.returncode = None
+        self.stderr = self._lines()
+        type(self).instances.append(self)
+
+    def _lines(self):
+        while not self.terminated:
+            time.sleep(0.01)
+            yield "frame= 1200 fps=25 q=-1.0 size= 51800kB speed=1x\n"
+
+    def wait(self, timeout=None):
+        if self.terminated or timeout is None:
+            self.returncode = 1
+            return 1
+        raise subprocess.TimeoutExpired(self.cmd, timeout)
+
+    def poll(self):
+        return 1 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+class _AdvancingFfmpeg:
+    """Reports and actually writes - a transfer that is working."""
+
+    instances: list["_AdvancingFfmpeg"] = []
+
+    def __init__(self, cmd, *args, **kwargs) -> None:
+        self.cmd = cmd
+        self.out = Path(cmd[-1])
+        self.terminated = False
+        self.finished = False
+        self.returncode = None
+        self.stderr = self._lines()
+        type(self).instances.append(self)
+
+    def _lines(self):
+        try:
+            for index in range(6):
+                time.sleep(0.05)
+                with self.out.open("ab") as handle:
+                    handle.write(b"media" * 200)
+                yield f"frame= {index} fps=25 q=-1.0\n"
+        finally:
+            self.finished = True
+
+    def wait(self, timeout=None):
+        if self.finished or timeout is None:
+            self.returncode = 0
+            return 0
+        raise subprocess.TimeoutExpired(self.cmd, timeout)
+
+    def poll(self):
+        return 0 if self.finished else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+class CliStallTests(unittest.TestCase):
+    """The regression: only the server path could abandon a dead transfer.
+
+    `FfmpegExecutor`, which the job layer runs, has watched the output file
+    since the reconnect flags went in. The CLI runs `download_with_ffmpeg`,
+    which called `subprocess.run` and waited for FFmpeg to decide it was
+    finished. Those reconnect flags are on both commands, and they are exactly
+    what stops FFmpeg ever deciding, so a dead stream that a job gives up on
+    after two minutes sat on the CLI until someone killed it by hand.
+    """
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.out_file = Path(self._temp.name) / "Clip.mp4"
+
+        _ChatteringFfmpeg.instances = []
+        _AdvancingFfmpeg.instances = []
+
+        for name, value in (("STALL_TIMEOUT_SECONDS", 0.3), ("SAMPLE_INTERVAL_SECONDS", 0.02)):
+            constant = patch.object(download_module, name, value)
+            constant.start()
+            self.addCleanup(constant.stop)
+
+    def _run(self, process_class) -> tuple[int, str, str]:
+        printed = io.StringIO()
+        with patch.object(download_module.subprocess, "Popen", process_class):
+            with redirect_stdout(printed):
+                returncode, summary = download_module._run_ffmpeg_captured(
+                    ["ffmpeg", "-i", "https://cdn.example.test/a.mp4", str(self.out_file)],
+                    self.out_file,
+                )
+        return returncode, summary, printed.getvalue()
+
+    def test_reporting_without_delivering_is_abandoned(self) -> None:
+        returncode, summary, _ = self._run(_ChatteringFfmpeg)
+
+        self.assertNotEqual(returncode, 0)
+        self.assertIn("no data written", summary)
+
+    def test_the_abandoned_process_is_stopped(self) -> None:
+        self._run(_ChatteringFfmpeg)
+
+        self.assertTrue(_ChatteringFfmpeg.instances[0].terminated)
+
+    def test_the_reason_reaches_the_operator(self) -> None:
+        # FFmpeg's own output ends on a line that looks like ordinary progress,
+        # so without this the run just stops with nothing explaining why.
+        _, _, printed = self._run(_ChatteringFfmpeg)
+
+        self.assertIn("no data written", printed)
+
+    def test_a_transfer_that_is_writing_is_left_alone(self) -> None:
+        # The other half: the watchdog must not fire on a working transfer just
+        # because it is slower than the timeout is short.
+        returncode, _, _ = self._run(_AdvancingFfmpeg)
+
+        self.assertEqual(returncode, 0)
+        self.assertFalse(_AdvancingFfmpeg.instances[0].terminated)
+
+    def test_a_working_transfer_keeps_ffmpeg_output(self) -> None:
+        _, _, printed = self._run(_AdvancingFfmpeg)
+
+        self.assertIn("frame=", printed)
+        self.assertNotIn("no data written", printed)
 
 
 if __name__ == "__main__":

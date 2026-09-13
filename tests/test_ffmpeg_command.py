@@ -15,8 +15,8 @@ from unittest.mock import patch
 
 from videotrack.core import download as download_module
 from videotrack.core.download import _headers_block, build_ffmpeg_command
-from videotrack.core.ffmpeg_executor import _resolved_binary
 from videotrack.core.models import CaptureResult, StreamCandidate
+from videotrack.core.preflight import resolve_tool
 
 OUT = Path("output") / "clip.mp4"
 
@@ -133,18 +133,25 @@ class HlsFlagTests(unittest.TestCase):
         self.assertLess(cmd.index("-protocol_whitelist"), cmd.index("-i"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ResolvedBinaryTests(unittest.TestCase):
     """How a configured FFmpeg location reaches argv[0].
 
-    The setting names a directory or the executable. `preflight.resolve_tool`
-    has always accepted both; the executor used to substitute the raw value, so
-    a directory - which is what the documented env var and the Settings field
-    both suggest - produced a command that could not run.
+    The setting names a directory or the executable, the two forms
+    `preflight.resolve_tool` accepts, because that is what the environment
+    variable and the Settings field are documented to take.
+
+    Asserted through the builder, which is now the only place that resolves.
+    The executor used to fix argv[0] up afterwards, so these cases were pinned
+    on a helper that every caller except the job executor bypassed.
     """
+
+    def setUp(self) -> None:
+        # The capability probes shell out to whatever argv[0] resolves to, and
+        # the fake binary installed below is an empty file.
+        for name in ("hls_strictness_flags", "network_resilience_flags"):
+            probe = patch.object(download_module, name, return_value=())
+            probe.start()
+            self.addCleanup(probe.stop)
 
     def _install_fake_ffmpeg(self, directory: Path) -> Path:
         binary = directory / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
@@ -152,29 +159,35 @@ class ResolvedBinaryTests(unittest.TestCase):
         binary.chmod(0o755)
         return binary
 
+    def _argv0(self, location: str | None) -> str:
+        return build_ffmpeg_command(_capture(), _candidate(), OUT, location)[0]
+
     def test_a_directory_resolves_to_the_executable_inside_it(self) -> None:
         with TemporaryDirectory() as temp:
             binary = self._install_fake_ffmpeg(Path(temp))
 
-            cmd = _resolved_binary(["ffmpeg", "-i", "in.m3u8"], temp)
-
-            self.assertEqual(Path(cmd[0]), binary)
-            self.assertEqual(cmd[1:], ["-i", "in.m3u8"])
+            self.assertEqual(Path(self._argv0(temp)), binary)
 
     def test_an_executable_path_is_honored_as_given(self) -> None:
         with TemporaryDirectory() as temp:
             binary = self._install_fake_ffmpeg(Path(temp))
 
-            cmd = _resolved_binary(["ffmpeg", "-i", "in.m3u8"], str(binary))
+            self.assertEqual(Path(self._argv0(str(binary))), binary)
 
-            self.assertEqual(Path(cmd[0]), binary)
-
-    def test_an_unusable_location_leaves_the_command_alone(self) -> None:
-        # The missing-tool error has to stay reachable rather than being masked.
+    def test_an_unusable_location_falls_back_to_path(self) -> None:
+        # Not "argv[0] stays the bare name": that only held on a machine with
+        # no FFmpeg on PATH, so the assertion passed for the wrong reason and
+        # the test failed on any machine that had one. What must hold is that a
+        # location which cannot be used neither wins over ordinary PATH
+        # resolution nor masks it with a path that cannot run.
         with TemporaryDirectory() as temp:
-            cmd = _resolved_binary(["ffmpeg", "-i", "in.m3u8"], str(Path(temp) / "absent"))
+            argv0 = self._argv0(str(Path(temp) / "absent"))
 
-            self.assertEqual(cmd[0], "ffmpeg")
+        self.assertEqual(argv0, resolve_tool("ffmpeg", None) or "ffmpeg")
 
-    def test_no_location_leaves_the_command_alone(self) -> None:
-        self.assertEqual(_resolved_binary(["ffmpeg", "-y"], None), ["ffmpeg", "-y"])
+    def test_no_location_leaves_path_resolution_alone(self) -> None:
+        self.assertEqual(self._argv0(None), resolve_tool("ffmpeg", None) or "ffmpeg")
+
+
+if __name__ == "__main__":
+    unittest.main()

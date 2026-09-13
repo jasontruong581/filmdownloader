@@ -20,6 +20,12 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from .executor import DownloadCancelled
+from .ffmpeg_process import (
+    SAMPLE_INTERVAL_SECONDS,
+    STALL_TIMEOUT_SECONDS,
+    OutputWatchdog,
+    stop_process,
+)
 from .models import CaptureResult, PageMetadata, StreamCandidate
 from .preflight import TEXT_OUTPUT, resolve_tool
 
@@ -404,18 +410,70 @@ def _run_command(cmd: list[str]) -> int:
         raise ToolNotFound(f"{cmd[0]} not found. Install it or set its location in settings.") from exc
 
 
-def _run_ffmpeg_captured(cmd: list[str]) -> tuple[int, str]:
-    """Run FFmpeg, keeping the tail of stderr so a failure can be explained."""
+def _collect_stderr(process: subprocess.Popen, into: list[str]) -> None:
+    """Read FFmpeg's stderr on a thread, so the caller keeps control of waiting.
+
+    Reading the pipe from the waiting thread is what made FFmpeg's hang the
+    caller's hang: a blocked read cannot notice anything else.
+    """
+    if process.stderr is None:
+        return
+    for line in process.stderr:
+        into.append(line)
+
+
+def _run_ffmpeg_captured(cmd: list[str], out_file: Path) -> tuple[int, str]:
+    """Run FFmpeg, keeping stderr so a failure can be explained.
+
+    Not `subprocess.run`, which returns when FFmpeg decides to exit - and a
+    reconnecting FFmpeg does not decide. The reconnect flags this command
+    carries are what let it survive a connection the far end drops, and the
+    price of them is a process that retries and reports forever on a stream
+    that is gone. Only the job executor watched for that, so the same dead
+    stream a job abandons after two minutes sat on this path - the one the
+    CLI takes - until someone killed it by hand.
+    """
     try:
-        proc = subprocess.run(cmd, capture_output=True, **TEXT_OUTPUT)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            **TEXT_OUTPUT,
+        )
     except FileNotFoundError as exc:
         raise ToolNotFound(f"{cmd[0]} not found. Install it or set its location in settings.") from exc
 
-    stderr = proc.stderr or ""
+    captured: list[str] = []
+    reader = threading.Thread(target=_collect_stderr, args=(process, captured), daemon=True)
+    reader.start()
+
+    watchdog = OutputWatchdog(
+        out_file, timeout=STALL_TIMEOUT_SECONDS, sample_interval=SAMPLE_INTERVAL_SECONDS
+    )
+    stalled = False
+    while True:
+        try:
+            process.wait(timeout=SAMPLE_INTERVAL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            if watchdog.stalled():
+                stalled = True
+                stop_process(process)
+                break
+
+    returncode = process.wait()
+    reader.join(timeout=2.0)
+
+    if stalled:
+        # FFmpeg says nothing about this itself: the last thing it printed was
+        # a normal line, and the exit code only records that it was terminated.
+        captured.append(watchdog.note() + "\n")
+
+    stderr = "".join(captured)
     if stderr:
         print(stderr, end="" if stderr.endswith("\n") else "\n")
-    summary = summarize_ffmpeg_error(stderr.splitlines(), proc.returncode)
-    return proc.returncode, summary
+    summary = summarize_ffmpeg_error(stderr.splitlines(), returncode)
+    return returncode, summary
 
 
 def _preferred_base(
@@ -474,7 +532,7 @@ def download_with_ffmpeg(
         return converted
 
     cmd = build_ffmpeg_command(capture, candidate, out_file)
-    returncode, stderr_tail = _run_ffmpeg_captured(cmd)
+    returncode, stderr_tail = _run_ffmpeg_captured(cmd, out_file)
 
     if returncode != 0:
         if is_hls_candidate(candidate):
