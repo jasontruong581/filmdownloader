@@ -160,6 +160,19 @@ Deciding whether a page's markup is recognized belongs inside
 needs the page body, and doing it in `handles()` would cost one extra request per
 plugin on every resolve.
 
+### Player hosts
+
+Most streaming sites do not host their own video; they embed one of a small
+number of player hosts. The host is therefore the unit worth supporting - a
+plugin for one reaches every site that embeds it, while a plugin per site
+reaches one site.
+
+`sites/embed.py` holds what every such plugin needs and registers nothing
+itself: reading media declarations out of player markup, following a nested
+frame or two, and `EmbedHostPlugin`, whose subclasses declare only a name and
+the hostnames they serve. `vlxx` uses the same reading helpers for its own
+player pages; what stays in `vlxx` is the part that is one site family's API.
+
 Bundled plugins:
 
 | Plugin | Claims | Contributes |
@@ -201,6 +214,10 @@ or served.
 
 ## Extending
 
+- **A new player host**: add a module under `sites/`, subclass
+  `EmbedHostPlugin`, declare `name` and `hosts`, and call `register()`. Prefer
+  this to a site plugin whenever the site's video comes from an embed: it
+  reaches every other site using the same host.
 - **A new site**: add a module under `sites/`, subclass `BaseSitePlugin`,
   implement only the hooks it needs, and call `register()`. Nothing in `core`
   changes.
