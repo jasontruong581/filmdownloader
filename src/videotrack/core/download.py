@@ -177,6 +177,20 @@ def is_hls_candidate(candidate: StreamCandidate) -> bool:
     return candidate.kind in {"hls", "playlist"} or ".m3u8" in url or "manifest" in url
 
 
+def is_dash_candidate(candidate: StreamCandidate) -> bool:
+    """Whether this candidate is an MPEG-DASH manifest."""
+    return candidate.kind == "dash" or ".mpd" in candidate.url.lower()
+
+
+def is_adaptive_candidate(candidate: StreamCandidate) -> bool:
+    """Whether a manifest demuxer will read this, rather than a plain file.
+
+    HLS and DASH are asked the same two favours because they enforce the same
+    two rules. Only HLS was being asked.
+    """
+    return is_hls_candidate(candidate) or is_dash_candidate(candidate)
+
+
 @lru_cache(maxsize=8)
 def hls_strictness_flags(ffmpeg_location: str | None = None) -> tuple[str, ...]:
     """Flags that relax the HLS demuxer, limited to what this FFmpeg accepts.
@@ -368,7 +382,14 @@ def build_ffmpeg_command(
         # same way, and has the same nothing to fall back on.
         cmd.extend(network_resilience_flags(ffmpeg_location))
 
-    if is_hls_candidate(candidate):
+    if is_adaptive_candidate(candidate):
+        # Both manifest demuxers gate which file extensions they will open, and
+        # both refuse a stream whose segments do not carry one they recognise.
+        # The DASH default is the narrower of the two - `aac,m4a,m4s,m4v,mov,
+        # mp4,webm,ts` - so a CDN that serves its segments from a path with no
+        # extension at all is refused with "blocked for security reasons" and
+        # no download. That was being answered for playlists and not for
+        # manifests, though it is one rule with two spellings.
         cmd.extend(
             [
                 "-protocol_whitelist",
@@ -377,6 +398,10 @@ def build_ffmpeg_command(
                 "ALL",
             ]
         )
+
+    if is_hls_candidate(candidate):
+        # Past here is the HLS demuxer's own strictness, which DASH has no
+        # equivalent of.
         cmd.extend(hls_strictness_flags(ffmpeg_location))
 
     cmd.extend(

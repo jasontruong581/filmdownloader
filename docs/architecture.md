@@ -56,6 +56,23 @@ Funnelling everything through one would lose real capability in either
 direction. The single cost of the split is that both must report through the same
 vocabulary, which is `core.events`.
 
+### Adaptive streams
+
+HLS and DASH are both read by a manifest demuxer, and both demuxers refuse a
+stream whose segments do not carry a file extension they recognise. Both are
+therefore given `-allowed_extensions ALL` and an explicit protocol whitelist.
+They are given nothing else in common: `-extension_picky` is an HLS option, and
+FFmpeg answers it on a DASH input with "Option not found" and opens nothing.
+
+What DASH does not have is the segment-by-segment fallback HLS has. That path
+exists for obfuscation - segments wrapped behind a PNG header, or served with a
+MIME type the demuxer rejects - which is an HLS practice; a DASH manifest that
+FFmpeg cannot read fails with FFmpeg's own reason and is not retried.
+
+Encrypted DASH is out of scope. FFmpeg will decrypt CENC given the key, but
+obtaining a Widevine or PlayReady key is the DRM itself, and this package does
+not do it. A manifest that needs one fails, and is meant to.
+
 ### The progress contract
 
 Three facts the shape has to respect, learned from what the tools actually emit:
