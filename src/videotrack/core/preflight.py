@@ -10,8 +10,11 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Final
 
 ENV_FFMPEG = "FILMDOWNLOADER_FFMPEG"
 
@@ -26,7 +29,13 @@ ENV_FFMPEG = "FILMDOWNLOADER_FFMPEG"
 #:
 #: `errors="replace"` is deliberate. A mangled character in a diagnostic is a
 #: cosmetic problem; an exception in a reader thread destroys the diagnostic.
-TEXT_OUTPUT: dict[str, object] = {"text": True, "encoding": "utf-8", "errors": "replace"}
+#:
+#: A read-only mapping, because nine call sites share this one object and a
+#: policy every subprocess in the package depends on should not be something
+#: any one of them can quietly rewrite for all the others.
+TEXT_OUTPUT: Final[Mapping[str, object]] = MappingProxyType(
+    {"text": True, "encoding": "utf-8", "errors": "replace"}
+)
 
 #: Tool name -> whether the pipeline can run at all without it.
 TOOLS: tuple[tuple[str, bool], ...] = (
