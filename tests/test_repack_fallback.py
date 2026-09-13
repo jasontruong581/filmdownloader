@@ -345,6 +345,12 @@ class RepackReportingTests(unittest.TestCase):
         self.addCleanup(self._temp.cleanup)
         self.out_file = Path(self._temp.name) / "Clip.mp4"
 
+        self.scratch = Path(self._temp.name) / "scratch"
+        self.scratch.mkdir()
+        patched = patch.object(download_module, "ensure_scratch_dir", return_value=self.scratch)
+        patched.start()
+        self.addCleanup(patched.stop)
+
     @staticmethod
     def _ts_payload() -> bytes:
         # Thirteen sync-byte-aligned packets, enough for the MPEG-TS check.
@@ -405,7 +411,293 @@ class RepackReportingTests(unittest.TestCase):
                     on_progress=report,
                 )
 
-        self.assertFalse(self.out_file.with_suffix(".ts").exists())
+        # Segments land in a workspace now rather than one growing `.ts`, and
+        # cancelling has to take the whole of it with it.
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertFalse(self.out_file.exists())
+
+
+class _Served:
+    """A tiny site: a URL map, and a record of what was asked for.
+
+    The repack's whole job here is fetching, so what it fetched and with which
+    headers is the thing worth asserting.
+    """
+
+    def __init__(self, routes: dict[str, object]) -> None:
+        self.routes = routes
+        self.requested: list[tuple[str, dict]] = []
+
+    def get(self, url, headers=None, **kwargs):
+        self.requested.append((url, dict(headers or {})))
+        body = self.routes.get(url)
+        if body is None:
+            raise AssertionError(f"unexpected request for {url}")
+        return _Reply(body)
+
+
+class _Reply:
+    def __init__(self, body) -> None:
+        self.ok = True
+        self.status_code = 206 if isinstance(body, tuple) else 200
+        raw = body[0] if isinstance(body, tuple) else body
+        if isinstance(raw, str):
+            self.text = raw
+            self.content = raw.encode("utf-8")
+        else:
+            self.text = ""
+            self.content = raw
+
+
+def _ts_bytes() -> bytes:
+    return b"".join(b"\x47" + bytes(187) for _ in range(13))
+
+
+class PlaylistAwareRepackTests(unittest.TestCase):
+    """What the fallback does with the lines it used to throw away.
+
+    Segments are written out as files and the playlist is rewritten against
+    them, so FFmpeg does the AES-128 decryption and the fMP4 assembly it has
+    always been able to do. What it could not do was fetch these segments.
+    """
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+        self.out_file = self.root / "Clip.mp4"
+
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        patched = patch.object(download_module, "ensure_scratch_dir", return_value=scratch)
+        patched.start()
+        self.addCleanup(patched.stop)
+
+        #: Filled in by the fake remux, which runs while the workspace still
+        #: exists - it is removed as soon as the repack returns.
+        self.playlist_text = ""
+        self.workspace: list[str] = []
+
+    def _remux(self, cmd: list[str]) -> int:
+        local = Path(cmd[cmd.index("-i") + 1])
+        self.playlist_text = local.read_text(encoding="utf-8")
+        self.workspace = sorted(path.name for path in local.parent.iterdir())
+        Path(cmd[-1]).write_bytes(b"remuxed")
+        return 0
+
+    def _repack(self, served: _Served):
+        with patch.object(download_module.requests, "get", served.get), patch.object(
+            download_module, "_run_command", self._remux
+        ):
+            return download_module.download_obfuscated_hls(
+                _capture(),
+                _candidate("https://cdn.example.test/hls/index.m3u8", "hls"),
+                self.out_file,
+                on_progress=lambda done, total: None,
+            )
+
+    def _encrypted_site(self, master: bool = False) -> _Served:
+        media = (
+            "#EXTM3U\n"
+            "#EXT-X-TARGETDURATION:10\n"
+            "#EXT-X-MEDIA-SEQUENCE:7\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+            "#EXTINF:9.009,\nseg0.ts\n"
+            "#EXTINF:9.009,\nseg1.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        routes: dict[str, object] = {
+            "https://cdn.example.test/hls/key.bin": b"0123456789abcdef",
+            "https://cdn.example.test/hls/seg0.ts": _ts_bytes(),
+            "https://cdn.example.test/hls/seg1.ts": _ts_bytes(),
+        }
+        if master:
+            routes["https://cdn.example.test/hls/index.m3u8"] = (
+                "#EXTM3U\n"
+                '#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS="avc1.4d401e,mp4a.40.2"\n'
+                "low.m3u8\n"
+                '#EXT-X-STREAM-INF:BANDWIDTH=2400000,CODECS="avc1.4d401f,mp4a.40.2"\n'
+                "high.m3u8\n"
+            )
+            routes["https://cdn.example.test/hls/high.m3u8"] = media
+        else:
+            routes["https://cdn.example.test/hls/index.m3u8"] = media
+        return _Served(routes)
+
+    def test_the_key_is_fetched_and_saved_beside_the_segments(self) -> None:
+        served = self._encrypted_site()
+
+        self._repack(served)
+
+        self.assertIn("https://cdn.example.test/hls/key.bin", [url for url, _ in served.requested])
+        self.assertTrue(any(name.startswith("key-") for name in self.workspace))
+
+    def test_the_local_playlist_keeps_the_key_line(self) -> None:
+        # Without it the segments are written into a container as ciphertext,
+        # and the download reports success.
+        self._repack(self._encrypted_site())
+
+        self.assertIn("#EXT-X-KEY:METHOD=AES-128", self.playlist_text)
+        self.assertIn('URI="key-', self.playlist_text)
+
+    def test_the_media_sequence_survives_the_rewrite(self) -> None:
+        # A key with no explicit IV takes one from the sequence number.
+        self._repack(self._encrypted_site())
+
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:7", self.playlist_text)
+
+    def test_the_key_is_fetched_once_however_many_segments_use_it(self) -> None:
+        served = self._encrypted_site()
+
+        self._repack(served)
+
+        keys = [url for url, _ in served.requested if url.endswith("key.bin")]
+        self.assertEqual(len(keys), 1)
+
+    def test_a_master_playlist_is_followed_to_its_best_rendition(self) -> None:
+        # It used to concatenate the variant playlists as if they were media.
+        served = self._encrypted_site(master=True)
+
+        self._repack(served)
+
+        asked = [url for url, _ in served.requested]
+        self.assertIn("https://cdn.example.test/hls/high.m3u8", asked)
+        self.assertNotIn("https://cdn.example.test/hls/low.m3u8", asked)
+
+    def test_an_init_segment_is_fetched_and_declared(self) -> None:
+        served = _Served(
+            {
+                "https://cdn.example.test/hls/index.m3u8": (
+                    "#EXTM3U\n"
+                    "#EXT-X-TARGETDURATION:4\n"
+                    '#EXT-X-MAP:URI="init.mp4"\n'
+                    "#EXTINF:4.000,\nseg0.m4s\n"
+                    "#EXT-X-ENDLIST\n"
+                ),
+                "https://cdn.example.test/hls/init.mp4": b"\x00\x00\x00\x18ftypiso5",
+                "https://cdn.example.test/hls/seg0.m4s": b"\x00\x00\x00\x18stypmsdh",
+            }
+        )
+
+        self._repack(served)
+
+        self.assertIn("https://cdn.example.test/hls/init.mp4", [url for url, _ in served.requested])
+        self.assertIn('#EXT-X-MAP:URI="init.bin"', self.playlist_text)
+        self.assertIn("init.bin", self.workspace)
+
+    def test_a_fragmented_segment_is_not_rejected_for_not_being_mpeg_ts(self) -> None:
+        # The sanity check only means something for plaintext MPEG-TS. An fMP4
+        # segment means nothing at all without the init segment beside it.
+        served = _Served(
+            {
+                "https://cdn.example.test/hls/index.m3u8": (
+                    "#EXTM3U\n"
+                    '#EXT-X-MAP:URI="init.mp4"\n'
+                    "#EXTINF:4.000,\nseg0.m4s\n"
+                    "#EXT-X-ENDLIST\n"
+                ),
+                "https://cdn.example.test/hls/init.mp4": b"\x00\x00\x00\x18ftypiso5",
+                "https://cdn.example.test/hls/seg0.m4s": b"not mpeg-ts at all",
+            }
+        )
+
+        self.assertEqual(self._repack(served), self.out_file)
+
+    def test_a_byte_ranged_segment_asks_for_its_slice(self) -> None:
+        # Two segments, one resource. Fetching it whole twice writes the entire
+        # file into the output once per slice.
+        served = _Served(
+            {
+                "https://cdn.example.test/hls/index.m3u8": (
+                    "#EXTM3U\n"
+                    "#EXTINF:9.009,\n#EXT-X-BYTERANGE:2444@0\nall.ts\n"
+                    "#EXTINF:9.009,\n#EXT-X-BYTERANGE:2444\nall.ts\n"
+                    "#EXT-X-ENDLIST\n"
+                ),
+                "https://cdn.example.test/hls/all.ts": (_ts_bytes(),),
+            }
+        )
+
+        self._repack(served)
+
+        ranges = [headers.get("Range") for url, headers in served.requested if url.endswith("all.ts")]
+        self.assertEqual(ranges, ["bytes=0-2443", "bytes=2444-4887"])
+
+    def test_the_local_playlist_has_no_byterange_left(self) -> None:
+        # Each slice is its own file now, so repeating the tag would slice it
+        # a second time.
+        served = _Served(
+            {
+                "https://cdn.example.test/hls/index.m3u8": (
+                    "#EXTM3U\n"
+                    "#EXTINF:9.009,\n#EXT-X-BYTERANGE:2444@0\nall.ts\n"
+                    "#EXT-X-ENDLIST\n"
+                ),
+                "https://cdn.example.test/hls/all.ts": (_ts_bytes(),),
+            }
+        )
+
+        self._repack(served)
+
+        self.assertNotIn("BYTERANGE", self.playlist_text)
+
+    def test_sample_aes_is_refused_rather_than_attempted(self) -> None:
+        # It would otherwise produce a file of the right size that is noise.
+        served = self._encrypted_site()
+        served.routes["https://cdn.example.test/hls/index.m3u8"] = str(
+            served.routes["https://cdn.example.test/hls/index.m3u8"]
+        ).replace("METHOD=AES-128", "METHOD=SAMPLE-AES")
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._repack(served)
+
+        self.assertIn("SAMPLE-AES", str(caught.exception))
+
+    def test_the_remux_is_told_to_accept_these_names(self) -> None:
+        # The segments are saved under names that say nothing about their
+        # contents, which is the state the strict demuxer refuses.
+        captured: list[list[str]] = []
+
+        def remux(cmd: list[str]) -> int:
+            captured.append(cmd)
+            return self._remux(cmd)
+
+        served = self._encrypted_site()
+        with patch.object(download_module.requests, "get", served.get), patch.object(
+            download_module, "_run_command", remux
+        ):
+            download_module.download_obfuscated_hls(
+                _capture(),
+                _candidate("https://cdn.example.test/hls/index.m3u8", "hls"),
+                self.out_file,
+                on_progress=lambda done, total: None,
+            )
+
+        cmd = captured[0]
+        self.assertIn("-allowed_extensions", cmd)
+        self.assertEqual(cmd[cmd.index("-allowed_extensions") + 1], "ALL")
+        self.assertIn("crypto", cmd[cmd.index("-protocol_whitelist") + 1])
+
+    def test_the_workspace_is_removed_afterwards(self) -> None:
+        self._repack(self._encrypted_site())
+
+        leftovers = list((self.root / "scratch").iterdir())
+        self.assertEqual(leftovers, [])
+
+    def test_the_workspace_is_removed_when_the_remux_fails(self) -> None:
+        served = self._encrypted_site()
+        with patch.object(download_module.requests, "get", served.get), patch.object(
+            download_module, "_run_command", return_value=1
+        ):
+            with self.assertRaises(RuntimeError):
+                download_module.download_obfuscated_hls(
+                    _capture(),
+                    _candidate("https://cdn.example.test/hls/index.m3u8", "hls"),
+                    self.out_file,
+                    on_progress=lambda done, total: None,
+                )
+
+        self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
 
 if __name__ == "__main__":
