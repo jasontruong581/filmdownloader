@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 
 from videotrack.core.capture import capture_page
 from videotrack.core.download import download_with_ffmpeg
+from videotrack.logs import configure_console_encoding
 from videotrack.sites.quatvn import discover_quatvn_targets, extract_quatvn_stream_candidates, is_quatvn_stream_url, is_quatvn_url
 
 BASE_FIELDNAMES = ["order", "id", "proceed_status", "url", "target_count", "completed_count", "last_error"]
@@ -341,6 +342,10 @@ def _process_quatvn_row(
 
 
 def main() -> int:
+    # Before the first print, for the reason the CLI and the server do it: the
+    # names this script reports are page titles, and a Windows console encodes
+    # with an ANSI codepage where a Vietnamese one raises UnicodeEncodeError.
+    configure_console_encoding()
     args = parse_args()
     csv_path = (ROOT / args.csv).resolve()
 
