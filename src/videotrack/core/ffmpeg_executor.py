@@ -19,7 +19,6 @@ from __future__ import annotations
 import queue
 import subprocess
 import threading
-import time
 from pathlib import Path
 
 from .download import (
@@ -43,76 +42,21 @@ from .events import (
     progress_event,
 )
 from .executor import DownloadCancelled, DownloadRequest
+from .ffmpeg_process import STALL_TIMEOUT_SECONDS, OutputWatchdog, stop_process
 from .ffmpeg_progress import FfmpegProgressParser
-from .preflight import TEXT_OUTPUT, resolve_tool
+from .preflight import TEXT_OUTPUT
 
 #: Where the diagnosis is searched for, rather than where it is assumed to be.
 #: Owned by `download` so the two places that read FFmpeg stderr agree.
 STDERR_TAIL_LINES = FFMPEG_STDERR_KEEP_LINES
 
-#: Seconds to wait after terminate() before killing.
-TERMINATE_GRACE_SECONDS = 5.0
-
 #: How often the reader loop checks the cancel flag while waiting on output.
+#: Doubles as the watchdog's sampling beat, since the loop is already awake.
 CANCEL_POLL_SECONDS = 0.25
-
-#: How long the output file may fail to grow before the attempt is abandoned.
-#:
-#: Generous, because opening a playlist and probing it legitimately writes
-#: nothing for a while. Measured on bytes rather than on FFmpeg reporting: a
-#: reconnecting FFmpeg reports forever, so chatter proves the process is alive
-#: and says nothing about whether the transfer is.
-STALL_TIMEOUT_SECONDS = 120.0
 
 #: Pushed by the reader thread once FFmpeg closes stdout, so the loop can tell
 #: "finished" from "still waiting" without polling the process.
 _STDOUT_CLOSED = object()
-
-
-def _size_of(path: Path) -> int:
-    """Bytes on disk, treating an absent or unreadable file as none."""
-    try:
-        return path.stat().st_size
-    except OSError:
-        return 0
-
-
-class _OutputWatchdog:
-    """Whether the transfer has stopped advancing, measured on the output file.
-
-    Liveness used to be measured on FFmpeg's own chatter, which is not the same
-    question. Asked to reconnect on a dropped stream, FFmpeg retries and reports
-    indefinitely: the process is busy, the log is moving, and no bytes are
-    arriving. A transfer was watched sitting at the same byte count for nineteen
-    minutes while it announced "downloading" the whole time.
-
-    Only the size of the file being written separates working from failing, so
-    that is what this measures.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._size = _size_of(path)
-        self._advanced_at = time.monotonic()
-        #: None means "not yet sampled", which must always sample. A zero
-        #: compared against a monotonic clock reads as a very old sample on a
-        #: long-running machine and a very recent one just after boot.
-        self._sampled_at: float | None = None
-
-    def stalled(self) -> bool:
-        now = time.monotonic()
-        if self._sampled_at is not None and now - self._sampled_at < CANCEL_POLL_SECONDS:
-            # FFmpeg reports several times a second; a stat() per report would
-            # be many calls to answer a question about a two-minute window.
-            return False
-        self._sampled_at = now
-
-        size = _size_of(self._path)
-        if size > self._size:
-            self._size = size
-            self._advanced_at = now
-            return False
-        return now - self._advanced_at >= STALL_TIMEOUT_SECONDS
 
 
 def _with_progress_flags(cmd: list[str]) -> list[str]:
@@ -120,23 +64,6 @@ def _with_progress_flags(cmd: list[str]) -> list[str]:
     if not cmd:
         return cmd
     return [cmd[0], "-nostats", "-progress", "pipe:1", *cmd[1:]]
-
-
-def _resolved_binary(cmd: list[str], ffmpeg_location: str | None) -> list[str]:
-    """Point argv[0] at the configured FFmpeg.
-
-    The setting names a directory or the executable itself, the same two forms
-    `preflight.resolve_tool` accepts, because that is what the environment
-    variable and the Settings field are documented to take. Substituting the
-    value verbatim turned a directory into an unrunnable argv[0].
-
-    An unusable location leaves the command alone so the existing missing-tool
-    error still surfaces rather than being masked by a path that cannot run.
-    """
-    if not ffmpeg_location or not cmd:
-        return cmd
-    resolved = resolve_tool(cmd[0], Path(ffmpeg_location))
-    return [resolved or cmd[0], *cmd[1:]]
 
 
 class FfmpegExecutor:
@@ -174,7 +101,7 @@ class FfmpegExecutor:
         cmd = build_ffmpeg_command(
             request.capture, request.candidate, part_file, request.ffmpeg_location
         )
-        cmd = _with_progress_flags(_resolved_binary(cmd, request.ffmpeg_location))
+        cmd = _with_progress_flags(cmd)
 
         parser = FfmpegProgressParser(duration_seconds=self.duration_hint, phase=PHASE_DOWNLOADING)
         folder = MonotonicProgress()
@@ -204,7 +131,9 @@ class FfmpegExecutor:
 
         cancelled = False
         stalled = False
-        watchdog = _OutputWatchdog(part_file)
+        watchdog = OutputWatchdog(
+            part_file, timeout=STALL_TIMEOUT_SECONDS, sample_interval=CANCEL_POLL_SECONDS
+        )
         try:
             while True:
                 try:
@@ -238,7 +167,7 @@ class FfmpegExecutor:
                     on_event(progress_event(folder.fold(sample)))
         finally:
             if cancelled or stalled or cancel.is_set():
-                _stop(process)
+                stop_process(process)
             returncode = process.wait()
             stderr_thread.join(timeout=2.0)
             stdout_thread.join(timeout=2.0)
@@ -248,13 +177,11 @@ class FfmpegExecutor:
             raise DownloadCancelled("cancelled before completion")
 
         if stalled:
-            # Said before FFmpeg's own tail, because FFmpeg reports nothing at
-            # all about this: the last thing it printed was a normal line, and
-            # the exit code only records that it was terminated.
-            stderr_tail.append(
-                f"stalled: no data written for {int(STALL_TIMEOUT_SECONDS)}s, "
-                "so the transfer was abandoned"
-            )
+            # FFmpeg reports nothing at all about this: the last thing it
+            # printed was a normal line, and the exit code only records that it
+            # was terminated. Appended, so it is the newest fault line and the
+            # summary's trim to the last few cannot drop it.
+            stderr_tail.append(watchdog.note())
 
         if returncode != 0:
             _discard(part_file)
@@ -357,16 +284,6 @@ def _drain_stderr(process: subprocess.Popen, tail: list[str]) -> None:
         tail.append(line.rstrip())
         if len(tail) > STDERR_TAIL_LINES * 4:
             del tail[: len(tail) - STDERR_TAIL_LINES]
-
-
-def _stop(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        process.kill()
 
 
 def _discard(path: Path) -> None:
