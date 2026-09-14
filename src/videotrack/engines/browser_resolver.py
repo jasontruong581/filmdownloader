@@ -25,6 +25,10 @@ class BrowserOptions:
     wait_seconds: int = 15
     headless: bool = True
     try_play: bool = True
+    #: An existing Chrome profile to capture with. Off by default: it reuses a
+    #: session the operator already holds and bypasses no access control, but
+    #: it also cannot run while that Chrome is open.
+    chrome_profile: str | None = None
 
 
 class BrowserResolver:
@@ -41,6 +45,7 @@ class BrowserResolver:
             wait_seconds=self.options.wait_seconds,
             headless=self.options.headless,
             try_play=self.options.try_play,
+            chrome_profile=self.options.chrome_profile,
         )
         media = tuple(
             ResolvedMedia(

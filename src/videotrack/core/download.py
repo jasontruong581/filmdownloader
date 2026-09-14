@@ -8,17 +8,21 @@ site.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Iterable
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
 
+from . import hls
 from .executor import DownloadCancelled
 from .ffmpeg_process import (
     SAMPLE_INTERVAL_SECONDS,
@@ -27,6 +31,7 @@ from .ffmpeg_process import (
     stop_process,
 )
 from .models import CaptureResult, PageMetadata, StreamCandidate
+from .paths import ensure_scratch_dir
 from .preflight import TEXT_OUTPUT, resolve_tool
 
 #: How much of FFmpeg stderr to hold on to while an attempt runs.
@@ -170,6 +175,20 @@ def is_hls_candidate(candidate: StreamCandidate) -> bool:
     """
     url = candidate.url.lower()
     return candidate.kind in {"hls", "playlist"} or ".m3u8" in url or "manifest" in url
+
+
+def is_dash_candidate(candidate: StreamCandidate) -> bool:
+    """Whether this candidate is an MPEG-DASH manifest."""
+    return candidate.kind == "dash" or ".mpd" in candidate.url.lower()
+
+
+def is_adaptive_candidate(candidate: StreamCandidate) -> bool:
+    """Whether a manifest demuxer will read this, rather than a plain file.
+
+    HLS and DASH are asked the same two favours because they enforce the same
+    two rules. Only HLS was being asked.
+    """
+    return is_hls_candidate(candidate) or is_dash_candidate(candidate)
 
 
 @lru_cache(maxsize=8)
@@ -363,7 +382,14 @@ def build_ffmpeg_command(
         # same way, and has the same nothing to fall back on.
         cmd.extend(network_resilience_flags(ffmpeg_location))
 
-    if is_hls_candidate(candidate):
+    if is_adaptive_candidate(candidate):
+        # Both manifest demuxers gate which file extensions they will open, and
+        # both refuse a stream whose segments do not carry one they recognise.
+        # The DASH default is the narrower of the two - `aac,m4a,m4s,m4v,mov,
+        # mp4,webm,ts` - so a CDN that serves its segments from a path with no
+        # extension at all is refused with "blocked for security reasons" and
+        # no download. That was being answered for playlists and not for
+        # manifests, though it is one rule with two spellings.
         cmd.extend(
             [
                 "-protocol_whitelist",
@@ -372,6 +398,10 @@ def build_ffmpeg_command(
                 "ALL",
             ]
         )
+
+    if is_hls_candidate(candidate):
+        # Past here is the HLS demuxer's own strictness, which DASH has no
+        # equivalent of.
         cmd.extend(hls_strictness_flags(ffmpeg_location))
 
     cmd.extend(
@@ -388,14 +418,6 @@ def build_ffmpeg_command(
 
 class ToolNotFound(RuntimeError):
     """An external binary is not on PATH or at its configured location."""
-
-
-def _discard_partial(path: Path) -> None:
-    """Remove a partial file, tolerating a Windows lock held by a dying process."""
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _run_command(cmd: list[str]) -> int:
@@ -577,6 +599,120 @@ def _is_mpeg_ts(data: bytes) -> bool:
     return hits >= max(2, checks - 3)
 
 
+#: Local names inside the repack workspace. Stable per key URI so a playlist
+#: that rotates keys and then returns to an earlier one reuses the same file.
+_LOCAL_INIT_NAME = "init.bin"
+
+
+def _local_key_name(key: hls.Key) -> str:
+    digest = hashlib.sha256((key.uri or "").encode("utf-8")).hexdigest()[:12]
+    return f"key-{digest}.bin"
+
+
+def _fetch(url: str, headers: dict[str, str], what: str) -> bytes:
+    response = requests.get(url, headers=headers, timeout=30)
+    if not response.ok:
+        raise RuntimeError(f"{what} request failed: HTTP {response.status_code}")
+    return response.content
+
+
+def _fetch_text(url: str, headers: dict[str, str], what: str) -> str:
+    """A playlist, decoded by `requests` the way it decodes any text response."""
+    response = requests.get(url, headers=headers, timeout=30)
+    if not response.ok:
+        raise RuntimeError(f"{what} request failed: HTTP {response.status_code}")
+    return response.text or ""
+
+
+def _fetch_range(
+    url: str,
+    headers: dict[str, str],
+    length: int,
+    offset: int,
+    what: str,
+) -> bytes:
+    """One slice of a resource, sliced locally when the server ignores Range.
+
+    A server that answers 200 to a ranged request has sent the whole thing, and
+    writing that as the segment repeats the entire file once per slice.
+    """
+    ranged = dict(headers)
+    ranged["Range"] = f"bytes={offset}-{offset + length - 1}"
+    response = requests.get(url, headers=ranged, timeout=30)
+    if not response.ok:
+        raise RuntimeError(f"{what} request failed: HTTP {response.status_code}")
+    if response.status_code == 206:
+        return response.content
+    return response.content[offset : offset + length]
+
+
+def _resolve_media_playlist(url: str, headers: dict[str, str]) -> hls.Playlist:
+    """The playlist that actually lists segments, following one master level.
+
+    One level, not a loop: a master pointing at a master is not something the
+    format describes, and following redirections indefinitely is how a bad
+    playlist turns into a request storm.
+    """
+    playlist = hls.parse_playlist(_fetch_text(url, headers, "manifest"), url)
+    if not playlist.is_master:
+        return playlist
+
+    variant = hls.best_variant(playlist)
+    if variant is None:
+        raise RuntimeError("master playlist lists no renditions")
+    body = _fetch_text(variant.uri, headers, "variant playlist")
+    resolved = hls.parse_playlist(body, variant.uri)
+    if resolved.is_master:
+        raise RuntimeError("master playlist points at another master playlist")
+    return resolved
+
+
+def _write_local_playlist(directory: Path, playlist: hls.Playlist, names: list[str]) -> Path:
+    """Rewrite the playlist against the files just downloaded.
+
+    Keeping the structure rather than flattening it is the point: FFmpeg then
+    does the AES-128 decryption and the fMP4 assembly, both of which it has
+    always been able to do. What it could not do was fetch these segments.
+
+    `#EXT-X-MEDIA-SEQUENCE` is carried over verbatim, because a key with no
+    explicit IV takes one from the segment's sequence number.
+    """
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        f"#EXT-X-TARGETDURATION:{playlist.target_duration}",
+        f"#EXT-X-MEDIA-SEQUENCE:{playlist.media_sequence}",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+    ]
+
+    current_key: hls.Key | None = None
+    current_init: str | None = None
+    for segment, name in zip(playlist.segments, names):
+        if segment.init_uri != current_init:
+            current_init = segment.init_uri
+            if current_init is not None:
+                lines.append(f'#EXT-X-MAP:URI="{_LOCAL_INIT_NAME}"')
+
+        if segment.key != current_key:
+            current_key = segment.key
+            if current_key is None or not current_key.encrypted:
+                lines.append("#EXT-X-KEY:METHOD=NONE")
+            else:
+                attributes = f'METHOD={current_key.method},URI="{_local_key_name(current_key)}"'
+                if current_key.iv:
+                    attributes += f",IV={current_key.iv}"
+                lines.append(f"#EXT-X-KEY:{attributes}")
+
+        lines.append(f"#EXTINF:{segment.duration:.6f},")
+        lines.append(name)
+
+    lines.append("#EXT-X-ENDLIST")
+
+    path = directory / "index.m3u8"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def download_obfuscated_hls(
     capture: CaptureResult,
     candidate: StreamCandidate,
@@ -591,72 +727,139 @@ def download_obfuscated_hls(
     Handles segments wrapped behind a PNG header and segments served with no
     usable extension, neither of which FFmpeg's own HLS demuxer will accept.
 
+    What FFmpeg cannot do here is *fetch* these segments. Everything else about
+    the playlist it handles better than this module would, so the segments are
+    written out as files and the playlist is rewritten against them: AES-128
+    decryption, fMP4 assembly from an initialisation segment, and the implicit
+    IVs that come from sequence numbers all stay FFmpeg's job.
+
     `on_progress` receives (done, total) per segment. A caller that passes it
     gets no stdout at all, which is what lets a server use this; the CLI passes
     nothing and keeps printing. `cancel` is polled between segments, the only
     place this can stop without leaving a torn file.
     """
     manifest_headers = _request_headers(capture, candidate.referer or capture.final_url)
-    response = requests.get(candidate.url, headers=manifest_headers, timeout=30)
-    if not response.ok:
-        raise RuntimeError(f"manifest request failed: HTTP {response.status_code}")
+    playlist = _resolve_media_playlist(candidate.url, manifest_headers)
 
-    lines = [line.strip() for line in (response.text or "").splitlines() if line.strip()]
-    segment_urls = [urljoin(candidate.url, line) for line in lines if not line.startswith("#")]
-    if not segment_urls:
+    if not playlist.segments:
         raise RuntimeError("manifest contains no segments")
 
+    unsupported = hls.unsupported_methods(playlist)
+    if unsupported:
+        raise RuntimeError(
+            f"playlist uses {', '.join(unsupported)} encryption, which this fallback cannot decrypt"
+        )
+
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    ts_path = out_file.with_suffix(".ts")
+    workspace = Path(tempfile.mkdtemp(prefix="repack-", dir=ensure_scratch_dir()))
     headers = _request_headers(capture, candidate.referer or candidate.url)
 
-    total = len(segment_urls)
-    with ts_path.open("wb") as ts:
-        for idx, seg_url in enumerate(segment_urls, start=1):
-            if cancel is not None and cancel.is_set():
-                ts.close()
-                _discard_partial(ts_path)
-                raise DownloadCancelled("cancelled while repacking segments")
-
-            seg_resp = requests.get(seg_url, headers=headers, timeout=30)
-            if not seg_resp.ok:
-                raise RuntimeError(f"segment request failed at {idx}/{total}: HTTP {seg_resp.status_code}")
-
-            payload = _extract_png_tail_payload(seg_resp.content)
-            if idx == 1 and not _is_mpeg_ts(payload):
-                raise RuntimeError("segment payload is not usable media after unwrapping")
-            ts.write(payload)
-
-            if on_progress is not None:
-                on_progress(idx, total)
-            elif idx % 50 == 0 or idx == total:
-                print(f"[i] Repacked segments: {idx}/{total}")
-
-    # Resolved rather than named: FFmpeg is regularly configured in Settings
-    # only, never placed on PATH, and this step used to ask for a bare `ffmpeg`.
-    # Every segment would download, and the repack then failed at the last
-    # moment claiming FFmpeg was not installed - by the same FFmpeg that had
-    # already run the attempt this fallback exists to rescue.
-    location = Path(ffmpeg_location).expanduser() if ffmpeg_location else None
-    remux_cmd = [
-        resolve_tool("ffmpeg", location) or "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-i",
-        str(ts_path),
-        "-c",
-        "copy",
-        str(out_file),
-    ]
-    returncode = _run_command(remux_cmd)
-    if returncode != 0:
-        raise RuntimeError(f"ffmpeg remux failed with exit code {returncode}")
-
     try:
-        ts_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+        names = _download_playlist_parts(
+            playlist, workspace, headers, cancel, on_progress
+        )
+        local = _write_local_playlist(workspace, playlist, names)
+
+        # Resolved rather than named: FFmpeg is regularly configured in Settings
+        # only, never placed on PATH, and this step used to ask for a bare
+        # `ffmpeg`. Every segment would download, and the repack then failed at
+        # the last moment claiming FFmpeg was not installed - by the same FFmpeg
+        # that had already run the attempt this fallback exists to rescue.
+        location = Path(ffmpeg_location).expanduser() if ffmpeg_location else None
+        remux_cmd = [
+            resolve_tool("ffmpeg", location) or "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            # The segments were saved under names that say nothing about their
+            # contents, which is the state the strict demuxer refuses.
+            "-allowed_extensions",
+            "ALL",
+            "-protocol_whitelist",
+            "file,crypto,data",
+            "-i",
+            str(local),
+            "-c",
+            "copy",
+            str(out_file),
+        ]
+        returncode = _run_command(remux_cmd)
+        if returncode != 0:
+            raise RuntimeError(f"ffmpeg remux failed with exit code {returncode}")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
     return out_file
+
+
+def _download_playlist_parts(
+    playlist: hls.Playlist,
+    workspace: Path,
+    headers: dict[str, str],
+    cancel: threading.Event | None,
+    on_progress: Callable[[int, int], None] | None,
+) -> list[str]:
+    """Fetch every key, initialisation segment, and media segment into a folder.
+
+    Returns the local file name of each segment, in playlist order.
+    """
+    fetched_keys: set[str] = set()
+    fetched_init = False
+    names: list[str] = []
+    total = len(playlist.segments)
+
+    for index, segment in enumerate(playlist.segments, start=1):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled("cancelled while repacking segments")
+
+        if segment.key is not None and segment.key.encrypted:
+            name = _local_key_name(segment.key)
+            if name not in fetched_keys:
+                (workspace / name).write_bytes(
+                    _fetch(segment.key.uri or "", headers, "key")
+                )
+                fetched_keys.add(name)
+
+        if segment.init_uri and not fetched_init:
+            (workspace / _LOCAL_INIT_NAME).write_bytes(
+                _extract_png_tail_payload(_fetch(segment.init_uri, headers, "init segment"))
+            )
+            fetched_init = True
+
+        what = f"segment {index}/{total}"
+        if segment.byterange is not None:
+            length, offset = segment.byterange
+            raw = _fetch_range(segment.uri, headers, length, offset, what)
+        else:
+            raw = _fetch(segment.uri, headers, what)
+
+        payload = _extract_png_tail_payload(raw)
+        if index == 1 and not _looks_like_media(segment, payload):
+            raise RuntimeError("segment payload is not usable media after unwrapping")
+
+        name = f"seg{index:05d}.bin"
+        (workspace / name).write_bytes(payload)
+        names.append(name)
+
+        if on_progress is not None:
+            on_progress(index, total)
+        elif index % 50 == 0 or index == total:
+            print(f"[i] Repacked segments: {index}/{total}")
+
+    return names
+
+
+def _looks_like_media(segment: hls.Segment, payload: bytes) -> bool:
+    """Whether the first segment is recognisable, when it is meant to be.
+
+    The check exists to catch a page that served something other than media,
+    and it can only run on plaintext MPEG-TS. Ciphertext is unrecognisable by
+    design, and an fMP4 segment means nothing without its init segment, so in
+    those two cases FFmpeg's own reading of the playlist is the check.
+    """
+    if segment.key is not None and segment.key.encrypted:
+        return True
+    if segment.init_uri is not None:
+        return True
+    return _is_mpeg_ts(payload)

@@ -121,17 +121,83 @@ def build_request_headers(capture: CaptureResult, referer: str | None = None) ->
     return headers
 
 
+#: URL shapes that name a player document rather than an asset of the page.
+#:
+#: Scored rather than merely matched, because only the first few are followed
+#: and each one costs a full browser session. `/embed/` and `/player/` are the
+#: long forms; `/e/<id>` is the short one most embed hosts actually serve, and
+#: matching only the long forms left those pages looking like a site with no
+#: player at all.
+#:
+#: The id-shaped patterns require a run of characters long enough not to match
+#: an ordinary route: `/e/` alone appears in plenty of paths that are not a
+#: player.
+EMBED_PATH_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"/embed[/\-_]", re.IGNORECASE), 100),
+    (re.compile(r"/player[/\-_]", re.IGNORECASE), 90),
+    (re.compile(r"/e/[0-9a-z]{4,}", re.IGNORECASE), 80),
+    (re.compile(r"/iframe", re.IGNORECASE), 70),
+    (re.compile(r"/v/[0-9a-z]{6,}", re.IGNORECASE), 50),
+]
+
+#: What the browser calls a document loaded into a frame. An embed is one; a
+#: script or an image that happens to sit under `/embed/` is not.
+EMBED_RESOURCE_TYPES: frozenset[str] = frozenset({"document", "iframe", "subdocument"})
+
+#: Added when the resource type says this really was a document.
+EMBED_DOCUMENT_BONUS = 40
+
+
+def _embed_score(url: str, resource_type: str | None) -> int | None:
+    """How much this looks like a player document, or None when it does not."""
+    parsed = urlparse(url)
+    if not parsed.scheme.startswith("http"):
+        return None
+
+    path = parsed.path or ""
+    score = max(
+        (points for pattern, points in EMBED_PATH_PATTERNS if pattern.search(path)),
+        default=0,
+    )
+    if not score:
+        return None
+
+    if any(pattern.search(url) for pattern in BLOCKED_URL_PATTERNS):
+        return None
+
+    # Ad frames are the other thing on these pages shaped like a player, and
+    # following one spends a browser session to find no media.
+    score -= _ad_url_penalty(url)
+    if (resource_type or "").lower() in EMBED_RESOURCE_TYPES:
+        score += EMBED_DOCUMENT_BONUS
+    return score
+
+
 def extract_embed_urls(capture: CaptureResult) -> list[str]:
-    found: OrderedDict[str, None] = OrderedDict()
-    for req in capture.requests:
-        url = req.url
-        parsed = urlparse(url)
-        path = (parsed.path or "").lower()
-        if not parsed.scheme.startswith("http"):
+    """Player documents the page loaded, best-looking first.
+
+    Ordered rather than merely collected: the deep scan follows only the first
+    few, and a page requests its advertising frames before its player often
+    enough that request order is not a ranking.
+
+    The page's own document is excluded. It is a document request like any
+    other, and following it re-captures the page that was just captured.
+    """
+    own = {capture.page_url, capture.final_url}
+    scored: dict[str, int] = {}
+    order: dict[str, int] = {}
+
+    for position, request in enumerate(capture.requests):
+        url = request.url
+        if url in own or url in scored:
             continue
-        if "/embed/" in path or "/player/" in path:
-            found[url] = None
-    return list(found.keys())
+        score = _embed_score(url, request.resource_type)
+        if score is None:
+            continue
+        scored[url] = score
+        order[url] = position
+
+    return sorted(scored, key=lambda url: (-scored[url], order[url]))
 
 
 def _host_allowed(host: str | None, allow_hosts: list[str]) -> bool:

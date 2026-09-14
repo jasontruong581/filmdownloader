@@ -56,6 +56,23 @@ Funnelling everything through one would lose real capability in either
 direction. The single cost of the split is that both must report through the same
 vocabulary, which is `core.events`.
 
+### Adaptive streams
+
+HLS and DASH are both read by a manifest demuxer, and both demuxers refuse a
+stream whose segments do not carry a file extension they recognise. Both are
+therefore given `-allowed_extensions ALL` and an explicit protocol whitelist.
+They are given nothing else in common: `-extension_picky` is an HLS option, and
+FFmpeg answers it on a DASH input with "Option not found" and opens nothing.
+
+What DASH does not have is the segment-by-segment fallback HLS has. That path
+exists for obfuscation - segments wrapped behind a PNG header, or served with a
+MIME type the demuxer rejects - which is an HLS practice; a DASH manifest that
+FFmpeg cannot read fails with FFmpeg's own reason and is not retried.
+
+Encrypted DASH is out of scope. FFmpeg will decrypt CENC given the key, but
+obtaining a Widevine or PlayReady key is the DRM itself, and this package does
+not do it. A manifest that needs one fails, and is meant to.
+
 ### The progress contract
 
 Three facts the shape has to respect, learned from what the tools actually emit:
@@ -160,6 +177,19 @@ Deciding whether a page's markup is recognized belongs inside
 needs the page body, and doing it in `handles()` would cost one extra request per
 plugin on every resolve.
 
+### Player hosts
+
+Most streaming sites do not host their own video; they embed one of a small
+number of player hosts. The host is therefore the unit worth supporting - a
+plugin for one reaches every site that embeds it, while a plugin per site
+reaches one site.
+
+`sites/embed.py` holds what every such plugin needs and registers nothing
+itself: reading media declarations out of player markup, following a nested
+frame or two, and `EmbedHostPlugin`, whose subclasses declare only a name and
+the hostnames they serve. `vlxx` uses the same reading helpers for its own
+player pages; what stays in `vlxx` is the part that is one site family's API.
+
 Bundled plugins:
 
 | Plugin | Claims | Contributes |
@@ -201,6 +231,10 @@ or served.
 
 ## Extending
 
+- **A new player host**: add a module under `sites/`, subclass
+  `EmbedHostPlugin`, declare `name` and `hosts`, and call `register()`. Prefer
+  this to a site plugin whenever the site's video comes from an embed: it
+  reaches every other site using the same host.
 - **A new site**: add a module under `sites/`, subclass `BaseSitePlugin`,
   implement only the hooks it needs, and call `register()`. Nothing in `core`
   changes.

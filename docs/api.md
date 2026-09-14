@@ -150,7 +150,7 @@ that directory and rejected if it escapes.
 `GET /settings`, `PUT /settings`.
 
 Editable: `output_dir`, `concurrency`, `engines`, `default_format`,
-`ffmpeg_location`, `cookies_from_browser`.
+`ffmpeg_location`, `cookies_from_browser`, `chrome_profile`.
 
 `concurrency` applies immediately. `host` and `port` are reported but not
 editable: changing where the server listens is not a runtime operation.
@@ -158,3 +158,10 @@ editable: changing where the server listens is not a runtime operation.
 `cookies_from_browser` is off by default and best effort; current Chrome's
 app-bound cookie encryption can defeat it. It reuses a session the operator
 already holds and bypasses no access control.
+
+`chrome_profile` is what browser capture uses instead, and the two are
+independent: `cookies_from_browser` lends cookies to yt-dlp, while this opens
+the profile itself, so the cookies a capture collects are the ones FFmpeg gets.
+It names either Chrome's user-data directory or one profile inside it. Also off
+by default, and with one more caveat: Chrome refuses to open a profile that is
+already open, so a capture using it fails while that Chrome is running.

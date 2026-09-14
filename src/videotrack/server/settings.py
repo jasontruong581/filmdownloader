@@ -44,6 +44,10 @@ class Settings:
     #: can defeat it. Reuses a session the operator already holds and bypasses
     #: no access control.
     cookies_from_browser: str = ""
+    #: Off for the same reason, and with one more caveat: Chrome refuses to
+    #: open a profile that is already open, so a capture using this fails while
+    #: the operator has that Chrome running.
+    chrome_profile: str = ""
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
 
@@ -81,6 +85,7 @@ EDITABLE_FIELDS = (
     "default_format",
     "ffmpeg_location",
     "cookies_from_browser",
+    "chrome_profile",
 )
 
 

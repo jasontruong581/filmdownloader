@@ -156,6 +156,7 @@ def collect_candidates(
                 wait_seconds=phase_wait,
                 headless=not options.headed,
                 try_play=True,
+                chrome_profile=options.chrome_profile,
             )
             embed_candidates = detect_candidates(
                 capture=embed_capture, probe=options.probe, host_bonuses=options.host_bonuses
@@ -321,6 +322,7 @@ def resolve_download_capture(
             wait_seconds=max(options.wait, 15),
             headless=not options.headed,
             try_play=True,
+            chrome_profile=options.chrome_profile,
         )
     except Exception as exc:  # noqa: BLE001
         _emit(on_event, INFO, message=f"Embed recapture failed, fallback to base capture: {exc}")

@@ -11,31 +11,8 @@ import requests
 from ..core.models import CrawlPreset, PageMetadata
 from ..core.resolvers import DEFAULT_USER_AGENT, Resolution, ResolvedMedia, media_kind
 from . import BaseSitePlugin, register
-
-MEDIA_URL_RE = re.compile(r"https?://[^\"'\s<>]+(?:m3u8|mp4|mpd)[^\"'\s<>]*", re.IGNORECASE)
-
-
-def _clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(value))).strip()
-
-
-def _page_title(page_html: str) -> str:
-    match = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
-    return _clean_text(match.group(1)) if match else ""
-
-
-def extract_media_urls(player_html: str, base_url: str) -> list[str]:
-    """Extract direct and JW-style media declarations from static player markup."""
-    found: dict[str, None] = {}
-    for match in MEDIA_URL_RE.finditer(player_html):
-        found[html.unescape(match.group(0))] = None
-
-    for value in re.findall(r"(?:file|src)\s*:\s*[\"']([^\"']+)[\"']", player_html, re.IGNORECASE):
-        url = urljoin(base_url, html.unescape(value))
-        if re.search(r"(?:m3u8|mp4|mpd)(?:$|[?&#])", url, re.IGNORECASE):
-            found[url] = None
-    return list(found)
-
+from .embed import extract_media_urls, fetch_page, media_from
+from .embed import page_title as _page_title
 
 def _movie_config(page_html: str) -> tuple[str | None, str | None]:
     for pattern in (
@@ -60,17 +37,17 @@ class StaticPlayerResolver:
         self.session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
 
     def _resolve_embed(self, embed_url: str) -> list[ResolvedMedia]:
-        try:
-            response = self.session.get(embed_url, headers={"Referer": embed_url}, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException:
+        page_html = fetch_page(embed_url, self.session, self.timeout)
+        if page_html is None:
             return []
 
-        urls = extract_media_urls(response.text or "", embed_url)
-        if urls:
-            return [ResolvedMedia(url, embed_url, media_kind(url)) for url in urls]
+        media = media_from(page_html, embed_url)
+        if media:
+            return media
 
-        id_match = re.search(r"window\.videoId\s*=\s*['\"]([^'\"]+)['\"]", response.text or "", re.IGNORECASE)
+        # Past here is this site family's own API rather than anything a player
+        # host does in general, which is why only the reading above is shared.
+        id_match = re.search(r"window\.videoId\s*=\s*['\"]([^'\"]+)['\"]", page_html, re.IGNORECASE)
         if not id_match:
             return []
         parsed = urlparse(embed_url)

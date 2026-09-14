@@ -24,6 +24,10 @@ class PipelineOptions:
     wait: int = 15
     extra_wait: int = 45
     headed: bool = False
+    #: An existing Chrome profile to capture with, so a page that needs a
+    #: logged-in session gets one. The cookies the capture collects are what
+    #: reach FFmpeg, so this is the only way the download side sees them.
+    chrome_profile: str | None = None
 
     # Candidate filtering and ranking.
     allow_hosts: list[str] = field(default_factory=list)
@@ -58,6 +62,7 @@ class PipelineOptions:
             wait=value("wait", defaults.wait),
             extra_wait=value("extra_wait", defaults.extra_wait),
             headed=value("headed", defaults.headed),
+            chrome_profile=value("chrome_profile", "") or None,
             allow_hosts=list(value("allow_host", []) or []),
             prefer_hosts=list(value("prefer_host", []) or []),
             host_bonuses=host_bonuses,
